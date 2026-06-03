@@ -15111,6 +15111,35 @@ class GatewayRunner:
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+            # janus-github-plugin#20 / team-ajk fork: if the platform adapter
+            # exposes on_interim_assistant(), wire it in so plugin adapters
+            # (e.g. janus-github) receive interim text and can PATCH in-flight
+            # placeholder comments without needing a stream consumer.
+            #
+            # on_interim_assistant(text, *, already_streamed, session_key) is
+            # called via safe_schedule_threadsafe so it runs on the event loop
+            # alongside the adapter's other async operations.
+            _plugin_interim_adapter = self.adapters.get(source.platform)
+            _plugin_on_interim = getattr(_plugin_interim_adapter, "on_interim_assistant", None)
+            if callable(_plugin_on_interim):
+                _captured_session_key = session_key or ""
+                _base_interim_cb = agent.interim_assistant_callback
+
+                def _plugin_interim_cb(text: str, *, already_streamed: bool = False) -> None:
+                    if _base_interim_cb is not None:
+                        _base_interim_cb(text, already_streamed=already_streamed)
+                    if not _run_still_current():
+                        return
+                    asyncio.run_coroutine_threadsafe(
+                        _plugin_on_interim(
+                            text,
+                            already_streamed=already_streamed,
+                            session_key=_captured_session_key,
+                        ),
+                        _loop_for_step,
+                    )
+
+                agent.interim_assistant_callback = _plugin_interim_cb
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
