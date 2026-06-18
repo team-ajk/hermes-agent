@@ -12427,6 +12427,35 @@ def cmd_prompt_size(args):
     _impl(args)
 
 
+def cmd_migrate_state(args):
+    """Copy SQLite session/state data into a PostgreSQL backend.
+
+    Thin delegator to the one-shot migration module. The import is guarded so a
+    base install without the optional ``postgres`` extra never crashes argparse
+    at startup — the helpful install hint only surfaces if the command is run.
+    """
+    try:
+        import migrate_state_to_postgres
+    except ImportError:
+        print(
+            "PostgreSQL support is not installed. Install the 'postgres' extra: "
+            "pip install 'hermes-agent[postgres]'"
+        )
+        return 1
+    argv = []
+    if getattr(args, "dsn", None):
+        argv += ["--dsn", args.dsn]
+    if getattr(args, "sqlite_path", None):
+        argv += ["--sqlite-path", args.sqlite_path]
+    try:
+        return migrate_state_to_postgres.main(argv)
+    except RuntimeError as exc:
+        # The migration raises a clear RuntimeError when the optional psycopg
+        # driver is missing at connection time; present it without a traceback.
+        print(str(exc))
+        return 1
+
+
 def cmd_logs(args):
     """View and filter Hermes log files."""
     from hermes_cli.logs import tail_log, list_logs
@@ -12979,6 +13008,27 @@ def main():
         help="Skip the timestamped backup of config.yaml when applying",
     )
     migrate_xai.set_defaults(func=cmd_migrate_xai)
+
+    migrate_state = migrate_subparsers.add_parser(
+        "state",
+        help="Copy SQLite session/state data into a PostgreSQL backend",
+        description=(
+            "One-shot, read-only migration of the SQLite state database into a "
+            "PostgreSQL backend. The SQLite source is never modified; it remains "
+            "the fallback until you verify the copy and set "
+            "sessions.state_backend=postgres in config.yaml."
+        ),
+    )
+    migrate_state.add_argument(
+        "--dsn",
+        help="PostgreSQL DSN (default: HERMES_STATE_DATABASE_URL / "
+        "HERMES_STATE_POSTGRES_DSN).",
+    )
+    migrate_state.add_argument(
+        "--sqlite-path",
+        help="Source SQLite state.db path (default: <hermes home>/state.db).",
+    )
+    migrate_state.set_defaults(func=cmd_migrate_state)
     migrate_parser.set_defaults(func=cmd_migrate)
 
     # =========================================================================
