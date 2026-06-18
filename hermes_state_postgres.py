@@ -211,6 +211,13 @@ def _translate_sql(sql: str) -> str:
         restores serialization lives in the compression-lock method, not here).
       * ``INSERT OR IGNORE INTO t ...`` -> ``INSERT INTO t ... ON CONFLICT DO
         NOTHING``.
+      * ``json_extract(COALESCE(<col>, '{}'), '$.<key>')`` -> PostgreSQL jsonb
+        text access ``(COALESCE(<col>, '{}')::jsonb ->> '<key>')``. SessionDB
+        emits this exact shape for the ``model_config`` markers (``_delegate_from``,
+        ``_branched_from``) in session-listing / lineage / delegate-cleanup
+        queries (hermes_state helpers ``_delegate_from_json`` /
+        ``_ephemeral_child_sql``). Untranslated, these are invalid PostgreSQL and
+        the session paths break.
       * ``?`` placeholders -> ``%s`` (psycopg paramstyle). String/identifier
         literals do not contain ``?`` in the SessionDB query set, so a direct
         replace is safe.
@@ -226,6 +233,17 @@ def _translate_sql(sql: str) -> str:
         flags=re.IGNORECASE,
     )
     insert_or_ignore = translated is not sql and translated != sql
+
+    # json_extract(COALESCE(<col>, '{}'), '$.<key>') -> jsonb text access.
+    # The SessionDB call sites always wrap the column in COALESCE(...,'{}') and
+    # use a top-level '$.<key>' path; we translate that closed shape rather than
+    # general JSONPath. `<col>` may be qualified (e.g. s.model_config).
+    translated = re.sub(
+        r"json_extract\(\s*COALESCE\(\s*([A-Za-z_][\w.]*)\s*,\s*'\{\}'\s*\)\s*,\s*'\$\.([A-Za-z_]\w*)'\s*\)",
+        r"(COALESCE(\1, '{}')::jsonb ->> '\2')",
+        translated,
+        flags=re.IGNORECASE,
+    )
 
     translated = translated.replace("?", "%s")
 
