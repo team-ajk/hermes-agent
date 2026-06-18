@@ -43,6 +43,13 @@ PostgresContainer = testcontainers_postgres.PostgresContainer
 # this BEFORE any testcontainers client is built.
 os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
 
+# Run the whole parity suite with the PostgreSQL adapter's strict mode ON, so
+# any SQLite-only idiom that reaches the adapter untranslated becomes a
+# deterministic test failure here instead of a runtime error in production.
+# This is what catches "a json_extract / pragma / fts5 slipped through the
+# translator" at CI time (see hermes_state_postgres._STRICT_FORBIDDEN).
+os.environ.setdefault("HERMES_PG_ADAPTER_STRICT", "1")
+
 # Driver-qualified URL schemes that testcontainers may emit; we normalize any of
 # them to the plain libpq scheme that psycopg.connect and our DSN passthrough
 # expect. Kept as scheme tokens (no credentials) on purpose.
@@ -330,7 +337,13 @@ def test_a4_lastrowid_returning_monotonic(pg_clean, tmp_path):
 
 def test_a5_compression_lock_exactly_one_winner(pg_clean, tmp_path):
     """a5 - many concurrent acquirers of the same session lock -> exactly one
-    winner on BOTH backends (PG via pg_advisory_xact_lock)."""
+    winner on BOTH backends (PG via pg_advisory_xact_lock).
+
+    The PG side patches config ONCE for the whole test (not per-thread): the
+    workers just call SessionDB() with the patch already in place, so there is
+    no race where a thread reads an un-patched load_config and silently builds a
+    SQLite db instead of a PG one.
+    """
     def one_winner(make_db, n=10):
         setup = make_db()
         setup.create_session(session_id="sess", source="cli")
@@ -357,18 +370,16 @@ def test_a5_compression_lock_exactly_one_winner(pg_clean, tmp_path):
     sq_state = tmp_path / "lock_state.db"
     assert one_winner(lambda: SessionDB(db_path=sq_state)) == 1
 
-    pg_dbs = []
-
-    def make_pg():
-        db, restore = _pg_session_db(pg_clean)
-        pg_dbs.append(restore)
-        return db
-
+    # PG: install the config patch ONCE, before any thread starts, so every
+    # worker's bare SessionDB() resolves to the PG backend deterministically.
+    import hermes_cli.config as cfgmod
+    original = cfgmod.load_config
+    cfg = {"sessions": {"state_backend": "postgres", "postgres_dsn": pg_clean}}
+    setattr(cfgmod, "load_config", lambda *a, **k: cfg)
     try:
-        assert one_winner(make_pg) == 1
+        assert one_winner(lambda: SessionDB()) == 1
     finally:
-        for restore in pg_dbs:
-            restore()
+        setattr(cfgmod, "load_config", original)
 
 
 def test_a6_like_case_insensitive(pg_clean, tmp_path):
@@ -446,6 +457,41 @@ def test_a8_json_extract_read(pg_clean, tmp_path):
     # Parity: the PostgreSQL backend returns the byte-identical stored value the
     # SQLite backend does (both round-trip model_config the same way).
     assert pg_cfg == sq_cfg
+
+
+def test_a9_json_extract_session_listing(pg_clean, tmp_path):
+    """a9 [regression] - SessionDB emits json_extract(COALESCE(model_config,
+    '{}'), '$.<key>') in its session-listing / lineage WHERE clauses
+    (_delegate_from_json). The PG adapter must translate that to jsonb access so
+    the query RUNS on PostgreSQL instead of erroring. Under strict mode an
+    untranslated json_extract would raise, so this both proves the translation
+    and locks the regression. (The original suite only exercised
+    search_messages, which is why this gap shipped.)"""
+    def list_count(db):
+        db.create_session(session_id="parent", source="cli")
+        db.create_session(session_id="child", source="cli",
+                          parent_session_id="parent",
+                          model_config='{"_delegate_from": "parent"}')
+        db.create_session(session_id="branch", source="cli",
+                          model_config='{"_branched_from": "parent"}')
+        # search_sessions builds a WHERE clause containing the json_extract
+        # marker filter; on PG this must execute, not raise.
+        return len(db.search_sessions(limit=100))
+
+    sq = _sqlite_session_db(tmp_path)
+    sq_n = list_count(sq)
+    sq.close()
+
+    pg, restore = _pg_session_db(pg_clean)
+    try:
+        pg_n = list_count(pg)
+        pg.close()
+    finally:
+        restore()
+
+    # Both backends return the same number of listed sessions, and crucially the
+    # PG query ran at all (it would have raised on an untranslated json_extract).
+    assert pg_n == sq_n
 
 
 def test_a_mig_source_untouched(pg_clean, tmp_path):
