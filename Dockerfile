@@ -164,10 +164,31 @@ RUN npm install --prefer-offline --no-audit && \
 # image update and recall/retain then fails with
 # `ModuleNotFoundError: No module named 'hindsight_client'` (#38128).
 #
+# The Matrix gateway's deps ([matrix] extra) are baked in because
+# python-olm (transitive via mautrix[encryption]) builds from source on
+# Python/image combinations without usable wheels.  The Docker image is
+# Linux-only, so keeping the native libolm/build-toolchain packages here
+# avoids the cross-platform failures that kept [matrix] out of [all]
+# while still making Matrix work in the published container. Fixes #30399.
+#
+# The PostgreSQL state backend's driver (psycopg, via the [postgres] extra)
+# is baked in so Docker users who set sessions.state_backend=postgres get a
+# working backend without runtime lazy-install access to PyPI. We use the
+# psycopg[binary] wheel (declared in pyproject.toml), which bundles libpq —
+# so no libpq-dev / build step is needed in the apt layer above.
+#
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra anthropic --extra bedrock --extra azure-identity --extra hindsight
+RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix --extra postgres
+
+# ---------- Frontend build (cached independently from Python source) ----------
+# Copy only the frontend source trees first so that Python-only changes don't
+# invalidate the (relatively slow) web + ui-tui build layer.
+COPY web/ web/
+COPY ui-tui/ ui-tui/
+RUN cd web && npm run build && \
+    cd ../ui-tui && npm run build
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
