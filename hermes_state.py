@@ -343,6 +343,19 @@ END;
 """
 
 
+def _is_postgres_retryable(exc: BaseException) -> bool:
+    """Lazy bridge to the optional PostgreSQL backend's retry classifier.
+
+    Kept here as a tiny shim so the SQLite-only write path never imports the
+    PostgreSQL module. Returns False if the backend module is unavailable.
+    """
+    try:
+        from hermes_state_postgres import is_postgres_retryable
+    except Exception:
+        return False
+    return is_postgres_retryable(exc)
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
@@ -372,7 +385,26 @@ class SessionDB:
 
         self._lock = threading.Lock()
         self._write_count = 0
+        self._fts_enabled = False
+        self._fts_unavailable_warned = False
+        self._is_postgres = False
+        self._conn = None
         try:
+            # Optional PostgreSQL state backend. Engaged only when configured
+            # (sessions.state_backend = "postgres"); the import is lazy so a
+            # default install without the 'postgres' extra never loads it.
+            # Read-only attaches and explicit db_path callers stay on SQLite.
+            if not read_only and db_path is None:
+                try:
+                    from hermes_state_postgres import maybe_open_postgres
+                except Exception:
+                    maybe_open_postgres = None
+                if maybe_open_postgres is not None:
+                    pg_conn = maybe_open_postgres(read_only, SCHEMA_VERSION)
+                    if pg_conn is not None:
+                        self._conn = pg_conn
+                        self._is_postgres = True
+                        return
             self._conn = sqlite3.connect(
                 str(self.db_path),
                 check_same_thread=False,
@@ -438,9 +470,12 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint.
+                # Success — periodic best-effort checkpoint (SQLite WAL only).
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                if (
+                    not self._is_postgres
+                    and self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0
+                ):
                     self._try_wal_checkpoint()
                 return result
             except sqlite3.OperationalError as exc:
@@ -455,6 +490,23 @@ class SessionDB:
                         time.sleep(jitter)
                         continue
                 # Non-lock error or retries exhausted — propagate.
+                raise
+            except Exception as exc:
+                # PostgreSQL surfaces write contention as serialization /
+                # deadlock failures (different exception type and message than
+                # SQLite's "locked"/"busy"), so the sqlite3 branch above never
+                # catches them. Apply the same jittered retry for the PG backend
+                # only; any other backend re-raises unchanged.
+                if not self._is_postgres or not _is_postgres_retryable(exc):
+                    raise
+                last_err = exc
+                if attempt < self._WRITE_MAX_RETRIES - 1:
+                    jitter = random.uniform(
+                        self._WRITE_RETRY_MIN_S,
+                        self._WRITE_RETRY_MAX_S,
+                    )
+                    time.sleep(jitter)
+                    continue
                 raise
         # Retries exhausted (shouldn't normally reach here).
         raise last_err or sqlite3.OperationalError(
@@ -490,10 +542,11 @@ class SessionDB:
         """
         with self._lock:
             if self._conn:
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except Exception:
-                    pass
+                if not self._is_postgres:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception:
+                        pass
                 self._conn.close()
                 self._conn = None
 
@@ -788,6 +841,176 @@ class SessionDB:
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
+            )
+        self._execute_write(_do)
+
+    def update_session_cwd(self, session_id: str, cwd: str) -> None:
+        """Persist the session working directory when a frontend knows it."""
+        if not session_id or not cwd:
+            return
+
+        def _do(conn):
+            conn.execute("UPDATE sessions SET cwd = ? WHERE id = ?", (cwd, session_id))
+
+        self._execute_write(_do)
+    # ──────────────────────────────────────────────────────────────────────
+    # Compression locks
+    # ──────────────────────────────────────────────────────────────────────
+    # Atomic per-session locks that prevent two compression paths from
+    # racing on the same session_id and producing orphan child sessions.
+    #
+    # The race: ``conversation_compression.py`` rotates ``agent.session_id``
+    # as a side effect of a successful compression (end old session, create
+    # new). That mutation is local to the AIAgent instance — but ``state.db``
+    # is shared across all instances. Two AIAgents that share the same
+    # ``session_id`` at the moment they both decide to compress (most
+    # commonly the parent turn's agent + a background-review fork started
+    # right after the turn ended) each end the parent and create their own
+    # NEW session, parented to the same old id. The gateway SessionEntry
+    # only catches one rotation; the other child silently accumulates
+    # writes — Damien's "parent → two orphan children" repro shape.
+    #
+    # The lock is keyed by ``session_id`` and is held for the duration of
+    # the compress() call plus the rotation. ``holder`` identifies the
+    # current owner (pid:tid:nonce) for diagnostics; the lock is recovered
+    # via ``expires_at`` if the holder process crashed without releasing.
+    def try_acquire_compression_lock(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Try to atomically acquire the compression lock for ``session_id``.
+
+        Returns ``True`` on success (caller now owns the lock and must
+        release via :meth:`release_compression_lock`).  Returns ``False``
+        if another holder already owns a non-expired lock — the caller
+        MUST NOT proceed with compression in that case (its rotation would
+        race against the holder's, splitting the session lineage).
+
+        Expired locks (``expires_at < now``) are reclaimed transparently:
+        the stale row is deleted and the new holder acquires it. This
+        prevents a crashed compressor from permanently blocking the
+        session.
+
+        Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
+        followed by a SELECT to confirm we got the row. SQLite serialises
+        writes, so the whole sequence is atomic against other writers.
+        """
+        if not session_id:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            if self._is_postgres:
+                from hermes_state_postgres import acquire_compression_lock_sql
+
+                return acquire_compression_lock_sql(
+                    conn, session_id, holder, now, expires_at
+                )
+            # First: reclaim any expired lock for this session_id.
+            conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND expires_at < ?",
+                (session_id, now),
+            )
+            # Then: try to insert. INSERT OR IGNORE returns no rowcount
+            # difference — verify ownership via SELECT.
+            conn.execute(
+                "INSERT OR IGNORE INTO compression_locks "
+                "(session_id, holder, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, holder, now, expires_at),
+            )
+            row = conn.execute(
+                "SELECT holder FROM compression_locks WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == holder
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "try_acquire_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+            # Fail open: returning False makes the caller skip compression,
+            # which is the safe behaviour when the lock subsystem is broken.
+            return False
+        except Exception as exc:
+            # Same fail-open behaviour for the PostgreSQL backend, whose driver
+            # raises its own error hierarchy rather than sqlite3.Error.
+            if not self._is_postgres:
+                raise
+            logger.warning(
+                "try_acquire_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+            return False
+
+    def release_compression_lock(self, session_id: str, holder: str) -> None:
+        """Release the compression lock for ``session_id`` iff we own it.
+
+        Idempotent: no-op when the lock has already expired and been
+        reclaimed by a different holder, or when no lock exists. The
+        ``holder`` check prevents a late-returning compressor from
+        clobbering a fresh lock held by someone else.
+        """
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND holder = ?",
+                (session_id, holder),
+            )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "release_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+
+    def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
+        """Return the current (non-expired) holder for ``session_id``, or None.
+
+        Diagnostic helper — not used by the locking protocol itself.
+        """
+        if not session_id:
+            return None
+        now = time.time()
+        row = self._conn.execute(
+            "SELECT holder FROM compression_locks "
+            "WHERE session_id = ? AND expires_at >= ?",
+            (session_id, now),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    def update_session_meta(
+        self,
+        session_id: str,
+        model_config_json: str,
+        model: Optional[str] = None,
+    ) -> None:
+        """Update model_config and optionally model for an existing session.
+
+        Uses COALESCE so that passing model=None leaves the stored model
+        column unchanged.  Routes through _execute_write for the standard
+        BEGIN IMMEDIATE + jitter-retry + lock guarantee.
+        """
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
+                (model_config_json, model, session_id),
             )
         self._execute_write(_do)
 
@@ -1440,13 +1663,17 @@ class SessionDB:
 
     # Sentinel prefix used to distinguish JSON-encoded structured content
     # (multimodal messages: lists of parts like text + image_url) from plain
-    # string content. The NUL byte is not legal in normal text, so this
-    # cannot collide with real user content.
-    _CONTENT_JSON_PREFIX = "\x00json:"
+    # string content. The control byte is not legal in normal text, so this
+    # cannot collide with real user content. The write prefix uses U+0001
+    # (START OF HEADING), which is storable across supported state backends;
+    # the legacy NUL-byte prefix is still accepted on read for rows written by
+    # older versions.
+    _CONTENT_JSON_PREFIX = "\x01json:"
+    _CONTENT_JSON_PREFIX_LEGACY = "\x00json:"
 
     @classmethod
     def _encode_content(cls, content: Any) -> Any:
-        """Serialize structured (list/dict) message content for sqlite.
+        """Serialize structured (list/dict) message content for storage.
 
         sqlite3 can only bind ``str``, ``bytes``, ``int``, ``float``, and ``None``
         to query parameters. Multimodal messages have ``content`` as a list of
@@ -1468,16 +1695,22 @@ class SessionDB:
 
     @classmethod
     def _decode_content(cls, content: Any) -> Any:
-        """Reverse :meth:`_encode_content`; returns scalars unchanged."""
-        if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
-            try:
-                return json.loads(content[len(cls._CONTENT_JSON_PREFIX):])
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(
-                    "Failed to decode JSON-encoded message content; "
-                    "returning raw string"
-                )
-                return content
+        """Reverse :meth:`_encode_content`; returns scalars unchanged.
+
+        Accepts both the current write prefix and the legacy NUL-byte prefix so
+        rows written by older versions decode correctly.
+        """
+        if isinstance(content, str):
+            for prefix in (cls._CONTENT_JSON_PREFIX, cls._CONTENT_JSON_PREFIX_LEGACY):
+                if content.startswith(prefix):
+                    try:
+                        return json.loads(content[len(prefix):])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            "Failed to decode JSON-encoded message content; "
+                            "returning raw string"
+                        )
+                        return content
         return content
 
     def append_message(
@@ -2182,6 +2415,29 @@ class SessionDB:
         ignores ``sort``. The trigram CJK path honours ``sort`` like the main
         FTS5 path.
         """
+        if self._is_postgres:
+            # PostgreSQL has no FTS5; dispatch to the degraded ILIKE search.
+            # Placed before the FTS-enabled gate below, which would otherwise
+            # short-circuit to [] on the PostgreSQL backend.
+            from hermes_state_postgres import search_messages_postgres
+
+            return search_messages_postgres(
+                self._conn,
+                self._decode_content,
+                query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+                sort=sort,
+                include_inactive=include_inactive,
+            )
+
+        if not self._fts_enabled:
+            return []
+
+
         if not query or not query.strip():
             return []
 
@@ -2517,23 +2773,37 @@ class SessionDB:
     # Export and cleanup
     # =========================================================================
 
-    def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Export a single session with all its messages as a dict."""
+    def export_session(
+        self, session_id: str, include_inactive: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Export a single session with its messages as a dict.
+
+        By default only active messages are exported. Pass
+        ``include_inactive=True`` to also include rewound (soft-deleted) rows —
+        needed for a full-fidelity copy (e.g. a backend migration).
+        """
         session = self.get_session(session_id)
         if not session:
             return None
-        messages = self.get_messages(session_id)
+        messages = self.get_messages(session_id, include_inactive=include_inactive)
         return {**session, "messages": messages}
 
-    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
+    def export_all(
+        self, source: str = None, include_inactive: bool = False
+    ) -> List[Dict[str, Any]]:
         """
         Export all sessions (with messages) as a list of dicts.
         Suitable for writing to a JSONL file for backup/analysis.
+
+        Pass ``include_inactive=True`` to include rewound (soft-deleted)
+        messages for a full-fidelity copy.
         """
         sessions = self.search_sessions(source=source, limit=100000)
         results = []
         for session in sessions:
-            messages = self.get_messages(session["id"])
+            messages = self.get_messages(
+                session["id"], include_inactive=include_inactive
+            )
             results.append({**session, "messages": messages})
         return results
 
