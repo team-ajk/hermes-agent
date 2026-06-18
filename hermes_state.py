@@ -654,6 +654,19 @@ END;
 """
 
 
+def _is_postgres_retryable(exc: BaseException) -> bool:
+    """Lazy bridge to the optional PostgreSQL backend's retry classifier.
+
+    Kept here as a tiny shim so the SQLite-only write path never imports the
+    PostgreSQL module. Returns False if the backend module is unavailable.
+    """
+    try:
+        from hermes_state_postgres import is_postgres_retryable
+    except Exception:
+        return False
+    return is_postgres_retryable(exc)
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
@@ -685,8 +698,24 @@ class SessionDB:
         self._write_count = 0
         self._fts_enabled = False
         self._fts_unavailable_warned = False
+        self._is_postgres = False
         self._conn = None
         try:
+            # Optional PostgreSQL state backend. Engaged only when configured
+            # (sessions.state_backend = "postgres"); the import is lazy so a
+            # default install without the 'postgres' extra never loads it.
+            # Read-only attaches and explicit db_path callers stay on SQLite.
+            if not read_only and db_path is None:
+                try:
+                    from hermes_state_postgres import maybe_open_postgres
+                except Exception:
+                    maybe_open_postgres = None
+                if maybe_open_postgres is not None:
+                    pg_conn = maybe_open_postgres(read_only, SCHEMA_VERSION)
+                    if pg_conn is not None:
+                        self._conn = pg_conn
+                        self._is_postgres = True
+                        return
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
                 # so we skip schema init entirely (no DDL, no FTS probe, no
@@ -900,9 +929,12 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint.
+                # Success — periodic best-effort checkpoint (SQLite WAL only).
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                if (
+                    not self._is_postgres
+                    and self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0
+                ):
                     self._try_wal_checkpoint()
                 return result
             except sqlite3.OperationalError as exc:
@@ -917,6 +949,23 @@ class SessionDB:
                         time.sleep(jitter)
                         continue
                 # Non-lock error or retries exhausted — propagate.
+                raise
+            except Exception as exc:
+                # PostgreSQL surfaces write contention as serialization /
+                # deadlock failures (different exception type and message than
+                # SQLite's "locked"/"busy"), so the sqlite3 branch above never
+                # catches them. Apply the same jittered retry for the PG backend
+                # only; any other backend re-raises unchanged.
+                if not self._is_postgres or not _is_postgres_retryable(exc):
+                    raise
+                last_err = exc
+                if attempt < self._WRITE_MAX_RETRIES - 1:
+                    jitter = random.uniform(
+                        self._WRITE_RETRY_MIN_S,
+                        self._WRITE_RETRY_MAX_S,
+                    )
+                    time.sleep(jitter)
+                    continue
                 raise
         # Retries exhausted (shouldn't normally reach here).
         raise last_err or sqlite3.OperationalError(
@@ -962,10 +1011,11 @@ class SessionDB:
         """
         with self._lock:
             if self._conn:
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception:
-                    pass
+                if not self._is_postgres:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception:
+                        pass
                 self._conn.close()
                 self._conn = None
 
@@ -1398,6 +1448,12 @@ class SessionDB:
         expires_at = now + ttl_seconds
 
         def _do(conn):
+            if self._is_postgres:
+                from hermes_state_postgres import acquire_compression_lock_sql
+
+                return acquire_compression_lock_sql(
+                    conn, session_id, holder, now, expires_at
+                )
             # First: reclaim any expired lock for this session_id.
             conn.execute(
                 "DELETE FROM compression_locks "
@@ -1429,6 +1485,16 @@ class SessionDB:
             )
             # Fail open: returning False makes the caller skip compression,
             # which is the safe behaviour when the lock subsystem is broken.
+            return False
+        except Exception as exc:
+            # Same fail-open behaviour for the PostgreSQL backend, whose driver
+            # raises its own error hierarchy rather than sqlite3.Error.
+            if not self._is_postgres:
+                raise
+            logger.warning(
+                "try_acquire_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
             return False
 
     def release_compression_lock(self, session_id: str, holder: str) -> None:
@@ -2322,13 +2388,17 @@ class SessionDB:
 
     # Sentinel prefix used to distinguish JSON-encoded structured content
     # (multimodal messages: lists of parts like text + image_url) from plain
-    # string content. The NUL byte is not legal in normal text, so this
-    # cannot collide with real user content.
-    _CONTENT_JSON_PREFIX = "\x00json:"
+    # string content. The control byte is not legal in normal text, so this
+    # cannot collide with real user content. The write prefix uses U+0001
+    # (START OF HEADING), which is storable across supported state backends;
+    # the legacy NUL-byte prefix is still accepted on read for rows written by
+    # older versions.
+    _CONTENT_JSON_PREFIX = "\x01json:"
+    _CONTENT_JSON_PREFIX_LEGACY = "\x00json:"
 
     @classmethod
     def _encode_content(cls, content: Any) -> Any:
-        """Serialize structured (list/dict) message content for sqlite.
+        """Serialize structured (list/dict) message content for storage.
 
         sqlite3 can only bind ``str``, ``bytes``, ``int``, ``float``, and ``None``
         to query parameters. Multimodal messages have ``content`` as a list of
@@ -2350,16 +2420,22 @@ class SessionDB:
 
     @classmethod
     def _decode_content(cls, content: Any) -> Any:
-        """Reverse :meth:`_encode_content`; returns scalars unchanged."""
-        if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
-            try:
-                return json.loads(content[len(cls._CONTENT_JSON_PREFIX):])
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(
-                    "Failed to decode JSON-encoded message content; "
-                    "returning raw string"
-                )
-                return content
+        """Reverse :meth:`_encode_content`; returns scalars unchanged.
+
+        Accepts both the current write prefix and the legacy NUL-byte prefix so
+        rows written by older versions decode correctly.
+        """
+        if isinstance(content, str):
+            for prefix in (cls._CONTENT_JSON_PREFIX, cls._CONTENT_JSON_PREFIX_LEGACY):
+                if content.startswith(prefix):
+                    try:
+                        return json.loads(content[len(prefix):])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            "Failed to decode JSON-encoded message content; "
+                            "returning raw string"
+                        )
+                        return content
         return content
 
     def append_message(
@@ -3287,6 +3363,25 @@ class SessionDB:
         Rewound (``active=0``) rows are excluded by default. Pass
         ``include_inactive=True`` to search every row.
         """
+        if self._is_postgres:
+            # PostgreSQL has no FTS5; dispatch to the degraded ILIKE search.
+            # Placed before the FTS-enabled gate below, which would otherwise
+            # short-circuit to [] on the PostgreSQL backend.
+            from hermes_state_postgres import search_messages_postgres
+
+            return search_messages_postgres(
+                self._conn,
+                self._decode_content,
+                query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+                sort=sort,
+                include_inactive=include_inactive,
+            )
+
         if not self._fts_enabled:
             return []
 
@@ -3718,23 +3813,37 @@ class SessionDB:
     # Export and cleanup
     # =========================================================================
 
-    def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Export a single session with all its messages as a dict."""
+    def export_session(
+        self, session_id: str, include_inactive: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Export a single session with its messages as a dict.
+
+        By default only active messages are exported. Pass
+        ``include_inactive=True`` to also include rewound (soft-deleted) rows —
+        needed for a full-fidelity copy (e.g. a backend migration).
+        """
         session = self.get_session(session_id)
         if not session:
             return None
-        messages = self.get_messages(session_id)
+        messages = self.get_messages(session_id, include_inactive=include_inactive)
         return {**session, "messages": messages}
 
-    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
+    def export_all(
+        self, source: str = None, include_inactive: bool = False
+    ) -> List[Dict[str, Any]]:
         """
         Export all sessions (with messages) as a list of dicts.
         Suitable for writing to a JSONL file for backup/analysis.
+
+        Pass ``include_inactive=True`` to include rewound (soft-deleted)
+        messages for a full-fidelity copy.
         """
         sessions = self.search_sessions(source=source, limit=100000)
         results = []
         for session in sessions:
-            messages = self.get_messages(session["id"])
+            messages = self.get_messages(
+                session["id"], include_inactive=include_inactive
+            )
             results.append({**session, "messages": messages})
         return results
 
