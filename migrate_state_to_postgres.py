@@ -9,8 +9,13 @@ conservative:
   has verified the PostgreSQL copy and flipped ``sessions.state_backend`` in
   config. Recovery from any failure is simply: drop the target tables and re-run
   from the untouched SQLite file.
-* **Idempotent.** Each session is replaced wholesale on import, so re-running
-  after a partial run converges to the same result.
+* **Idempotent.** Each session is imported with skip-on-conflict semantics
+  (``INSERT ... ON CONFLICT DO NOTHING``), so re-running after a partial run
+  fills in the sessions/messages that did not land the first time without
+  duplicating rows. Note this does NOT refresh rows that already exist in the
+  target — the migration targets a fresh database, where that case does not
+  arise; if a source row changed after a prior partial import, drop the target
+  database and re-run for a clean copy.
 * **Full fidelity.** Rewound (soft-deleted) messages are included, message ids
   and timestamps are preserved, and content is re-encoded through the live
   encode chokepoint so no legacy NUL-byte sentinel ever reaches PostgreSQL.
