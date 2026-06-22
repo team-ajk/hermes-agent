@@ -398,8 +398,14 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    include_current: bool = False,
 ) -> str:
-    """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
+    """Discovery shape: FTS5 + anchored window + bookends per hit. Single call.
+
+    By default the current session lineage is skipped — discovery is for
+    "what did we talk about *before*". Pass ``include_current=True`` when the
+    caller wants in-thread recall ("what did we say earlier in this thread").
+    """
     role_list = role_filter if role_filter else ["user", "assistant"]
 
     try:
@@ -425,26 +431,54 @@ def _discover(
             "message": "No matching sessions found.",
         }, ensure_ascii=False)
 
-    current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
+    current_lineage_root = (
+        _resolve_to_parent(db, current_session_id)
+        if current_session_id and not include_current
+        else None
+    )
 
     # Dedupe by lineage. Keep the raw owning session_id on the surviving
     # row — only that pairs validly with the FTS5 match id for the anchored
     # window. parent_session_id is exposed separately when different.
     seen_sessions = {}
+    excluded_current_session = 0
     for r in raw_results:
         raw_sid = r["session_id"]
         resolved_sid = _resolve_to_parent(db, raw_sid)
-        # Skip the current session lineage
-        if current_lineage_root and resolved_sid == current_lineage_root:
-            continue
-        if current_session_id and raw_sid == current_session_id:
-            continue
+        # Skip the current session lineage unless caller opted in.
+        if not include_current:
+            if current_lineage_root and resolved_sid == current_lineage_root:
+                excluded_current_session += 1
+                continue
+            if current_session_id and raw_sid == current_session_id:
+                excluded_current_session += 1
+                continue
         if resolved_sid not in seen_sessions:
             row = dict(r)
             row["_lineage_root"] = resolved_sid
             seen_sessions[resolved_sid] = row
         if len(seen_sessions) >= limit:
             break
+
+    # If every match was in the current session, tell the caller — silent zero
+    # here is what made callers think the search was broken or the topic was
+    # never discussed. Return shape stays consistent; the message + count are
+    # additive so existing JSON consumers don't break.
+    if not seen_sessions and excluded_current_session > 0:
+        return json.dumps({
+            "success": True,
+            "mode": "discover",
+            "query": query,
+            "results": [],
+            "count": 0,
+            "sessions_searched": 0,
+            "excluded_current_session": excluded_current_session,
+            "message": (
+                f"All {excluded_current_session} match(es) for {query!r} are in the "
+                "current session. Pass include_current=true to see them, or scroll "
+                "within this session."
+            ),
+        }, ensure_ascii=False)
 
     results = []
     for lineage_root, match_info in seen_sessions.items():
@@ -504,6 +538,7 @@ def session_search(
     window: int = 5,
     # Discovery shape
     sort: str = None,
+    include_current: bool = False,
     # Cross-profile (any shape)
     profile: str = None,
 ) -> str:
@@ -613,6 +648,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        include_current=bool(include_current),
     )
 
 
@@ -753,6 +789,17 @@ SESSION_SEARCH_SCHEMA = {
                     "pass the profile segment here with session_id as the id segment. "
                     "Omit to use the current profile."
                 ),
+            },
+            "include_current": {
+                "type": "boolean",
+                "description": (
+                    "Discovery shape only. By default the current session is excluded "
+                    "from results — discovery is for \"what did we talk about before\". "
+                    "Set true for in-thread recall (\"what did we say earlier in this "
+                    "thread about X\") when you want session_search to match against "
+                    "the current conversation as well. Defaults to false."
+                ),
+                "default": False,
             },
         },
         "required": [],

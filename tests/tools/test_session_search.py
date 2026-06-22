@@ -204,6 +204,58 @@ class TestDiscoveryShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
+    def test_all_matches_in_current_session_returns_informative_message(self, db):
+        """When every match is in the current session, surface the count + a
+        hint rather than silently returning zero. The silent-zero behaviour
+        made callers think search was broken or the topic was never discussed."""
+        _seed_modpack_sessions(db)
+        # Search for a term that ONLY appears in s_newest, while telling
+        # session_search that s_newest IS the current session.
+        result = json.loads(session_search(
+            query="alternator",  # only in s_newest's last message
+            db=db,
+            current_session_id="s_newest",
+        ))
+        assert result["success"] is True
+        assert result["mode"] == "discover"
+        assert result["count"] == 0
+        assert result["sessions_searched"] == 0
+        assert result["excluded_current_session"] >= 1
+        assert "current session" in result["message"].lower()
+        assert "include_current" in result["message"]
+
+    def test_include_current_true_returns_current_session_hits(self, db):
+        """``include_current=True`` lets the caller search the current
+        conversation — for in-thread recall ('what did we say earlier')."""
+        _seed_modpack_sessions(db)
+        result = json.loads(session_search(
+            query="alternator",
+            db=db,
+            current_session_id="s_newest",
+            include_current=True,
+        ))
+        assert result["success"] is True
+        assert result["count"] >= 1
+        sids = [r["session_id"] for r in result["results"]]
+        assert "s_newest" in sids
+
+    def test_include_current_false_is_the_default(self, db):
+        """Default behaviour is unchanged: current session is excluded
+        unless the caller opts in. Guards against regressing the original
+        intent."""
+        _seed_modpack_sessions(db)
+        result_default = json.loads(session_search(
+            query="modpack", db=db, current_session_id="s_newest",
+        ))
+        result_explicit = json.loads(session_search(
+            query="modpack", db=db, current_session_id="s_newest",
+            include_current=False,
+        ))
+        sids_default = sorted(r["session_id"] for r in result_default["results"])
+        sids_explicit = sorted(r["session_id"] for r in result_explicit["results"])
+        assert sids_default == sids_explicit
+        assert "s_newest" not in sids_default
+
 
 class TestDiscoverySort:
     def test_sort_newest_orders_by_recency(self, db):
