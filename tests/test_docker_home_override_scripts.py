@@ -40,10 +40,19 @@ def test_main_wrapper_preserves_docker_workdir() -> None:
 
 
 def test_dashboard_run_resets_home_before_dropping_privileges() -> None:
+    """HOME must be reset before dropping privileges, resolved from the
+    hermes user passwd entry (with /opt/data as the safety fallback).
+    The hardcoded ``export HOME=/opt/data`` was replaced with a passwd
+    lookup so embedders that customize the hermes user home dir get the
+    value they declared instead of having it silently force-overridden.
+    See ``docker/main-wrapper.sh`` for full rationale.
+    """
     text = DASHBOARD_RUN.read_text(encoding="utf-8")
 
     assert "#!/command/with-contenv sh" in text
-    assert "export HOME=/opt/data" in text
+    # passwd-resolved HOME with /opt/data fallback (stock image unchanged).
+    assert "getent passwd hermes" in text
+    assert 'export HOME="${_hermes_passwd_home:-/opt/data}"' in text
     assert "exec s6-setuidgid hermes hermes dashboard" in text
 
 
