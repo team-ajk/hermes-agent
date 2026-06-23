@@ -206,12 +206,14 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
     # v19 — Native FTS column for tokenized AND-search (parity with SQLite FTS5).
     # ADD COLUMN with no DEFAULT is a metadata-only change on PG 11+ — no table
     # rewrite, no ACCESS EXCLUSIVE lock beyond milliseconds. The GIN index build
-    # is CONCURRENTLY (non-blocking). New rows are kept up to date by the
-    # cursor hook (_update_fts_content called after each message INSERT). Existing
-    # rows require a one-time backfill (see runbook) to become searchable via FTS.
-    # CONCURRENTLY failure retries next connect without hard-failing startup.
-    # Uses 'simple' dictionary (lowercase only, no stemming) — correct for a
-    # multilingual corpus with code identifiers, proper nouns, and Hebrew names.
+    # is CONCURRENTLY (non-blocking). NEW rows are populated by the per-INSERT
+    # hook (_update_fts_content); EXISTING rows stay fts_content IS NULL until
+    # the operator runs the one-time backfill UPDATE (see the runbook in the PR
+    # / module docstring). Until backfill completes, search stays on the ILIKE
+    # path (which covers all rows) — see _fts_backfill_complete. optional=True so
+    # a transient CONCURRENTLY failure retries next connect without hard-failing
+    # startup. Uses 'simple' dictionary (lowercase only, no stemming) — correct
+    # for a multilingual corpus with code identifiers, proper nouns, and names.
     PostgresMigration(
         version=19,
         optional=True,
@@ -462,6 +464,21 @@ def _needs_returning_id(sql: str) -> bool:
     return head.startswith("INSERT INTO MESSAGES")
 
 
+def _parse_insert_columns(sql: str) -> Optional[List[str]]:
+    """Return the ordered column names from an ``INSERT INTO messages (...)``.
+
+    Returns None when the column list cannot be parsed (e.g. an INSERT without
+    an explicit column list). Used by the fts_content hook to map insert params
+    to columns by NAME rather than by fixed position, so it works for both the
+    live ``append_message`` insert and the migration-import insert (which use
+    different column orders).
+    """
+    m = re.search(r"INSERT\s+INTO\s+messages\s*\(([^)]*)\)", sql, re.IGNORECASE)
+    if not m:
+        return None
+    return [c.strip() for c in m.group(1).split(",") if c.strip()]
+
+
 def _fts_column_available(conn: Any) -> bool:
     """Return True if the fts_content column exists on the messages table.
 
@@ -487,6 +504,35 @@ def _fts_column_available(conn: Any) -> bool:
     return result
 
 
+def _fts_backfill_complete(conn: Any) -> bool:
+    """Return True if every messages row has a non-NULL fts_content.
+
+    While legacy rows remain un-backfilled (fts_content IS NULL), an FTS-only
+    query would silently miss them, so search_messages_postgres stays on the
+    ILIKE path (which covers all rows) until backfill finishes.
+
+    Caching is monotonic-safe: once we observe completeness we cache True
+    permanently (the per-INSERT hook keeps new rows non-NULL, so the table can
+    never regress to having NULLs). While incomplete we re-probe each call —
+    cheap because EXISTS short-circuits on the first NULL row via the partial
+    index / seq scan and the answer flips at most once per process.
+    """
+    if getattr(conn, "_fts_backfill_done", False):
+        return True
+    if not _fts_column_available(conn):
+        return False
+    try:
+        row = conn._conn.execute(
+            "SELECT 1 FROM messages WHERE fts_content IS NULL LIMIT 1"
+        ).fetchone()
+        complete = row is None
+    except Exception:
+        complete = False
+    if complete:
+        conn._fts_backfill_done = True
+    return complete
+
+
 def _build_tsquery(conn: Any, query: str) -> Optional[str]:
     """Parse *query* into a PostgreSQL tsquery text, or return None.
 
@@ -506,9 +552,10 @@ def _build_tsquery(conn: Any, query: str) -> Optional[str]:
 
     # Strip FTS5-specific prefix wildcard (*) — websearch_to_tsquery handles
     # quoted phrases and OR/- natively but not the FTS5 "term*" prefix form.
-    # Strip trailing * from each token so "deploy*" becomes "deploy" rather
-    # than producing a parse error or silent mismatch.
-    cleaned = re.sub(r"\*+", "", query).strip()
+    # Only strip a * that terminates a word token (followed by whitespace or
+    # end-of-string), i.e. the FTS5 prefix marker "deploy*". Asterisks embedded
+    # mid-token (e.g. "a*b") are left intact so non-FTS queries keep meaning.
+    cleaned = re.sub(r"(\w)\*+(?=\s|$)", r"\1", query).strip()
     if not cleaned:
         return None
 
@@ -579,20 +626,23 @@ class _PostgresCursor:
             self.lastrowid = row[0] if row else None
             # Keep fts_content current for new message rows so FTS search
             # works on freshly written messages without a separate backfill.
+            # Map insert params to columns BY NAME (parsed from the INSERT
+            # column list) so this is correct for both the live append_message
+            # insert and the migration-import insert, which use different
+            # column orders. If the column list can't be parsed, skip silently.
             if self.lastrowid is not None and self._conn is not None:
-                # Extract content/tool_name/tool_calls from the INSERT params.
-                # The INSERT column order is fixed by hermes_state.py:
-                # (session_id, role, content, tool_call_id, tool_calls,
-                #  tool_name, timestamp, ...). Indices 2, 5, 4.
                 try:
-                    p = list(params or ())
-                    content = p[2] if len(p) > 2 else None
-                    tool_calls = p[4] if len(p) > 4 else None
-                    tool_name = p[5] if len(p) > 5 else None
-                    _update_fts_content(
-                        self._conn, self.lastrowid,
-                        content, tool_name, tool_calls,
-                    )
+                    cols = _parse_insert_columns(translated)
+                    if cols:
+                        p = list(params or ())
+                        by_name = {c: (p[i] if i < len(p) else None)
+                                   for i, c in enumerate(cols)}
+                        _update_fts_content(
+                            self._conn, self.lastrowid,
+                            by_name.get("content"),
+                            by_name.get("tool_name"),
+                            by_name.get("tool_calls"),
+                        )
                 except Exception:
                     pass  # never let fts update failure break the write path
         return self
@@ -917,9 +967,14 @@ def search_messages_postgres(
 
     sort_norm = sort.strip().lower() if isinstance(sort, str) else None
 
-    # ── FTS path (v19 column present) ────────────────────────────────────────
+    # ── FTS path (v19 column present AND backfill complete) ───────────────────
+    # While the column exists but legacy rows are still fts_content IS NULL,
+    # an FTS-only query would silently miss every un-backfilled row. To honor
+    # the "old rows fall through to ILIKE until backfill" contract, we only take
+    # the FTS path once no NULL rows remain. ILIKE covers all rows regardless,
+    # so it is the correct choice during the backfill window.
     tsq = _build_tsquery(conn, query)
-    if tsq is not None:
+    if tsq is not None and _fts_backfill_complete(conn):
         try:
             matches = _search_messages_fts(
                 conn, decode_content, tsq,
@@ -938,7 +993,7 @@ def search_messages_postgres(
                 "FTS search failed, falling back to ILIKE", exc_info=True
             )
 
-    # ── ILIKE fallback ────────────────────────────────────────────────────────
+    # ── ILIKE fallback (column absent, backfill incomplete, empty tsquery) ────
     return _search_messages_ilike(
         conn, decode_content, query,
         source_filter=source_filter,
