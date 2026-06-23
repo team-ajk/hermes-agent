@@ -902,7 +902,13 @@ def import_session(conn: Any, decode_content, encode_content,
     conn.execute(
         f"INSERT OR IGNORE INTO sessions ({', '.join(_SESSION_COLUMNS)}) "
         f"VALUES ({placeholders})",
-        tuple(session_data.get(col) for col in _SESSION_COLUMNS),
+        tuple(
+            # rewind_count and archived are NOT NULL DEFAULT 0 in Postgres but
+            # may be NULL in old SQLite rows that predate the column addition.
+            session_data.get(col) if col not in ("rewind_count", "archived")
+            else (session_data.get(col) or 0)
+            for col in _SESSION_COLUMNS
+        ),
     )
 
     msg_placeholders = ", ".join("?" for _ in _MESSAGE_COLUMNS)
@@ -918,7 +924,13 @@ def import_session(conn: Any, decode_content, encode_content,
         conn.execute(
             f"INSERT OR IGNORE INTO messages ({', '.join(_MESSAGE_COLUMNS)}) "
             f"VALUES ({msg_placeholders})",
-            tuple(row.get(col) for col in _MESSAGE_COLUMNS),
+            tuple(
+                # active is NOT NULL DEFAULT 1 in Postgres but may be NULL in
+                # old SQLite rows that predate the column addition.
+                row.get(col) if col != "active"
+                else (row.get(col) if row.get(col) is not None else 1)
+                for col in _MESSAGE_COLUMNS
+            ),
         )
 
     # Keep the IDENTITY sequence ahead of the largest imported id so future
