@@ -11747,6 +11747,25 @@ def main():
         help="Source SQLite state.db path (default: <hermes home>/state.db).",
     )
     migrate_state.set_defaults(func=cmd_migrate_state)
+
+    # Alias: upstream PR #39301 used the name 'state-postgres'; support both
+    # so operators coming from that documentation don't hit a confusing error.
+    migrate_state_pg_alias = migrate_subparsers.add_parser(
+        "state-postgres",
+        help="Alias for 'state' — copy SQLite session/state data into PostgreSQL",
+        parents=[],
+    )
+    migrate_state_pg_alias.add_argument(
+        "--dsn",
+        help="PostgreSQL DSN (default: HERMES_STATE_DATABASE_URL / "
+        "HERMES_STATE_POSTGRES_DSN).",
+    )
+    migrate_state_pg_alias.add_argument(
+        "--sqlite-path",
+        help="Source SQLite state.db path (default: <hermes home>/state.db).",
+    )
+    migrate_state_pg_alias.set_defaults(func=cmd_migrate_state)
+
     migrate_parser.set_defaults(func=cmd_migrate)
 
     # =========================================================================
