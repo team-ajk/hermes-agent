@@ -26,6 +26,7 @@ install without the ``postgres`` extra never imports this module.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -200,6 +201,25 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
             "    ON messages USING GIN (tool_name gin_trgm_ops);\n"
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_tool_calls_trgm"
             "    ON messages USING GIN (tool_calls gin_trgm_ops)"
+        ),
+    ),
+    # v19 — Native FTS column for tokenized AND-search (parity with SQLite FTS5).
+    # ADD COLUMN with no DEFAULT is a metadata-only change on PG 11+ — no table
+    # rewrite, no ACCESS EXCLUSIVE lock beyond milliseconds. The GIN index build
+    # is CONCURRENTLY (non-blocking). Existing rows are backfilled by the
+    # Python-side UPDATE in _update_fts_content (called after each message
+    # INSERT) or via the manual backfill runbook. optional=True so a transient
+    # CONCURRENTLY failure retries next connect without hard-failing startup.
+    # Uses 'simple' dictionary (lowercase only, no stemming) — correct for a
+    # multilingual corpus with code identifiers, proper nouns, and Hebrew names.
+    PostgresMigration(
+        version=19,
+        optional=True,
+        sql=(
+            "ALTER TABLE messages"
+            " ADD COLUMN IF NOT EXISTS fts_content tsvector;\n"
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_fts_gin"
+            "    ON messages USING GIN (fts_content)"
         ),
     ),
 ]
@@ -442,11 +462,110 @@ def _needs_returning_id(sql: str) -> bool:
     return head.startswith("INSERT INTO MESSAGES")
 
 
+def _fts_column_available(conn: Any) -> bool:
+    """Return True if the fts_content column exists on the messages table.
+
+    Cached on the connection object after the first probe so subsequent
+    search calls pay zero extra round-trips. Uses pg_catalog (faster than
+    information_schema, no access-check view overhead).
+    """
+    cached = getattr(conn, "_fts_col_available", None)
+    if cached is not None:
+        return cached
+    try:
+        row = conn._conn.execute(
+            "SELECT 1 FROM pg_catalog.pg_attribute a"
+            " JOIN pg_catalog.pg_class c ON c.oid = a.attrelid"
+            " WHERE c.relname = 'messages'"
+            " AND a.attname = 'fts_content'"
+            " AND a.attnum > 0"
+        ).fetchone()
+        result = row is not None
+    except Exception:
+        result = False
+    conn._fts_col_available = result
+    return result
+
+
+def _build_tsquery(conn: Any, query: str) -> Optional[str]:
+    """Parse *query* into a PostgreSQL tsquery text, or return None.
+
+    Uses ``websearch_to_tsquery('simple', ...)`` which handles implicit AND,
+    OR, quoted phrases, and ``-`` exclusion. Falls back to
+    ``plainto_tsquery('simple', ...)`` on parse error (e.g. a bare ``-``).
+    Returns None when:
+    - the ``fts_content`` column doesn't exist yet (v19 migration pending), or
+    - the tsquery is empty (stopword-only or unrecognised input).
+    The caller treats None as "use ILIKE instead".
+
+    Uses 'simple' dictionary (lowercase only, no stemming) so code identifiers,
+    proper nouns, and non-English terms are indexed and matched verbatim.
+    """
+    if not _fts_column_available(conn):
+        return None
+
+    # Strip FTS5-specific prefix wildcard (*) — websearch_to_tsquery handles
+    # quoted phrases and OR/- natively but not the FTS5 "term*" prefix form.
+    # Strip trailing * from each token so "deploy*" becomes "deploy" rather
+    # than producing a parse error or silent mismatch.
+    cleaned = re.sub(r"\*+", "", query).strip()
+    if not cleaned:
+        return None
+
+    try:
+        row = conn._conn.execute(
+            "SELECT websearch_to_tsquery('simple', %s)::text",
+            (cleaned,),
+        ).fetchone()
+        tsq = row[0] if row else None
+    except Exception:
+        tsq = None
+
+    if not tsq:
+        try:
+            row = conn._conn.execute(
+                "SELECT plainto_tsquery('simple', %s)::text",
+                (cleaned,),
+            ).fetchone()
+            tsq = row[0] if row else None
+        except Exception:
+            return None
+
+    return tsq or None  # empty string → None
+
+
+def _update_fts_content(conn: Any, msg_id: int,
+                        content: Any, tool_name: Any, tool_calls: Any) -> None:
+    """Update the fts_content column for a freshly inserted message row.
+
+    Called by ``_PostgresCursor.execute`` immediately after each message INSERT
+    so new rows are searchable without a separate backfill. Silently skipped
+    when the v19 column doesn't exist yet. Uses 'simple' dictionary to match
+    _build_tsquery.
+    """
+    if not _fts_column_available(conn):
+        return
+    try:
+        text = (
+            str(content or "") + " " +
+            str(tool_name or "") + " " +
+            str(tool_calls or "")
+        )
+        conn._conn.execute(
+            "UPDATE messages SET fts_content = to_tsvector('simple', %s)"
+            " WHERE id = %s",
+            (text, msg_id),
+        )
+    except Exception:
+        logger.debug("fts_content update failed for message %s", msg_id, exc_info=True)
+
+
 class _PostgresCursor:
     """Translate the small ``sqlite3.Cursor`` surface SessionDB relies on."""
 
-    def __init__(self, cursor: Any):
+    def __init__(self, cursor: Any, conn: Any = None):
         self._cursor = cursor
+        self._conn = conn  # _PostgresConnection reference, for fts_content hook
         self.lastrowid: Optional[int] = None
 
     def execute(self, sql: str, params: Any = ()):
@@ -458,6 +577,24 @@ class _PostgresCursor:
         if want_id:
             row = self._cursor.fetchone()
             self.lastrowid = row[0] if row else None
+            # Keep fts_content current for new message rows so FTS search
+            # works on freshly written messages without a separate backfill.
+            if self.lastrowid is not None and self._conn is not None:
+                # Extract content/tool_name/tool_calls from the INSERT params.
+                # The INSERT column order is fixed by hermes_state.py:
+                # (session_id, role, content, tool_call_id, tool_calls,
+                #  tool_name, timestamp, ...). Indices 2, 5, 4.
+                try:
+                    p = list(params or ())
+                    content = p[2] if len(p) > 2 else None
+                    tool_calls = p[4] if len(p) > 4 else None
+                    tool_name = p[5] if len(p) > 5 else None
+                    _update_fts_content(
+                        self._conn, self.lastrowid,
+                        content, tool_name, tool_calls,
+                    )
+                except Exception:
+                    pass  # never let fts update failure break the write path
         return self
 
     def executescript(self, sql_script: str):
@@ -521,8 +658,8 @@ class _PostgresConnection:
     def __init__(self, conn: Any):
         self._conn = conn
 
-    def cursor(self) -> _PostgresCursor:
-        return _PostgresCursor(self._conn.cursor())
+    def cursor(self):
+        return _PostgresCursor(self._conn.cursor(), conn=self)
 
     def execute(self, sql: str, params: Any = ()) -> _PostgresCursor:
         return self.cursor().execute(sql, params)
@@ -759,27 +896,69 @@ def search_messages_postgres(
     sort: Optional[str] = None,
     include_inactive: bool = False,
 ) -> List[Dict[str, Any]]:
-    """ILIKE substring search for the PostgreSQL backend, GIN-accelerated when
-    pg_trgm is installed (migrations v17/v18).
+    """Tokenized FTS search for the PostgreSQL backend (SQLite FTS5 parity).
 
-    Intentionally uses portable ILIKE semantics rather than emulating FTS5
-    query syntax (boolean operators, prefix ``*``, phrase quoting). Matches the
-    SQLite ``search_messages`` result contract so callers stay backend-agnostic.
+    When the v19 migration has run (``fts_content tsvector`` column present),
+    uses ``fts_content @@ tsquery`` with ``'simple'`` dictionary — tokenized
+    AND-search, word-order-independent, matching code identifiers and proper
+    nouns without stemming. Multi-word queries behave like SQLite FTS5:
+    "docker deployment" matches any message containing both words anywhere.
+
+    Falls back to ILIKE substring search when:
+    - the v19 column is absent (migration pending), or
+    - the query produces an empty tsquery (pure punctuation / no tokens).
+
+    The result-row contract is identical to the SQLite ``search_messages``
+    path: id/session_id/role/snippet/timestamp/tool_name/source/model/
+    session_started + a bounded before/anchor/after ``context`` window.
     """
     if not query or not query.strip():
         return []
 
-    # Escape LIKE metacharacters so a query containing % or _ matches literally.
-    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    like = f"%{escaped}%"
+    sort_norm = sort.strip().lower() if isinstance(sort, str) else None
 
-    where = [
-        "(m.content ILIKE ? ESCAPE '\\' OR m.tool_name ILIKE ? ESCAPE '\\' "
-        "OR m.tool_calls ILIKE ? ESCAPE '\\')"
-    ]
-    params: list = [like, like, like]
+    # ── FTS path (v19 column present) ────────────────────────────────────────
+    tsq = _build_tsquery(conn, query)
+    if tsq is not None:
+        try:
+            matches = _search_messages_fts(
+                conn, decode_content, tsq,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+                sort_norm=sort_norm,
+                include_inactive=include_inactive,
+            )
+            _attach_context(conn, decode_content, matches)
+            return matches
+        except Exception:
+            logger.warning(
+                "FTS search failed, falling back to ILIKE", exc_info=True
+            )
+
+    # ── ILIKE fallback ────────────────────────────────────────────────────────
+    return _search_messages_ilike(
+        conn, decode_content, query,
+        source_filter=source_filter,
+        exclude_sources=exclude_sources,
+        role_filter=role_filter,
+        limit=limit,
+        offset=offset,
+        sort_norm=sort_norm,
+        include_inactive=include_inactive,
+    )
+
+
+def _build_where(
+    source_filter, exclude_sources, role_filter, include_inactive, params,
+    prefix="m",
+):
+    """Build shared WHERE clauses for FTS and ILIKE paths."""
+    where = []
     if not include_inactive:
-        where.append("m.active = 1")
+        where.append(f"{prefix}.active = 1")
     if source_filter is not None:
         where.append("s.source IN (%s)" % ",".join("?" for _ in source_filter))
         params.extend(source_filter)
@@ -789,8 +968,82 @@ def search_messages_postgres(
     if role_filter:
         where.append("m.role IN (%s)" % ",".join("?" for _ in role_filter))
         params.extend(role_filter)
+    return where
 
-    sort_norm = sort.strip().lower() if isinstance(sort, str) else None
+
+def _search_messages_fts(
+    conn: Any,
+    decode_content,
+    tsq: str,
+    source_filter, exclude_sources, role_filter,
+    limit, offset, sort_norm, include_inactive,
+) -> List[Dict[str, Any]]:
+    """Execute the tsvector FTS search path. Returns matches without context."""
+    params: list = [tsq]  # for fts_content @@ %s::tsquery
+    where = ["m.fts_content @@ %s::tsquery"]
+    where += _build_where(
+        source_filter, exclude_sources, role_filter, include_inactive, params
+    )
+
+    if sort_norm == "oldest":
+        order_by = "ORDER BY m.timestamp ASC, ts_rank(m.fts_content, %s::tsquery) DESC"
+    elif sort_norm == "newest":
+        order_by = "ORDER BY m.timestamp DESC, ts_rank(m.fts_content, %s::tsquery) DESC"
+    else:
+        order_by = "ORDER BY ts_rank(m.fts_content, %s::tsquery) DESC, m.timestamp DESC"
+    params.append(tsq)  # for ts_rank
+    params.extend([limit, offset])
+
+    rows = conn.execute(
+        f"""
+        SELECT m.id, m.session_id, m.role, m.content, m.timestamp, m.tool_name,
+               s.source, s.model, s.started_at AS session_started
+        FROM messages m
+        JOIN sessions s ON s.id = m.session_id
+        WHERE {' AND '.join(where)}
+        {order_by}
+        LIMIT ? OFFSET ?
+        """,
+        params,
+    ).fetchall()
+
+    matches = []
+    for r in rows:
+        preview = _content_preview(decode_content, r["content"])
+        matches.append({
+            "id": r["id"],
+            "session_id": r["session_id"],
+            "role": r["role"],
+            "snippet": preview[:200],
+            "timestamp": r["timestamp"],
+            "tool_name": r["tool_name"],
+            "source": r["source"],
+            "model": r["model"],
+            "session_started": r["session_started"],
+        })
+    return matches
+
+
+def _search_messages_ilike(
+    conn: Any,
+    decode_content,
+    query: str,
+    source_filter, exclude_sources, role_filter,
+    limit, offset, sort_norm, include_inactive,
+) -> List[Dict[str, Any]]:
+    """Execute the ILIKE fallback search path. Returns matches with context."""
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = f"%{escaped}%"
+
+    params: list = [like, like, like]
+    where = [
+        "(m.content ILIKE ? ESCAPE '\\' OR m.tool_name ILIKE ? ESCAPE '\\' "
+        "OR m.tool_calls ILIKE ? ESCAPE '\\')"
+    ]
+    where += _build_where(
+        source_filter, exclude_sources, role_filter, include_inactive, params
+    )
+
     order_by = "ORDER BY m.timestamp ASC" if sort_norm == "oldest" else "ORDER BY m.timestamp DESC"
     params.extend([limit, offset])
 
@@ -807,7 +1060,7 @@ def search_messages_postgres(
         params,
     ).fetchall()
 
-    matches: List[Dict[str, Any]] = []
+    matches = []
     for r in rows:
         preview = _content_preview(decode_content, r["content"])
         matches.append({
@@ -822,7 +1075,12 @@ def search_messages_postgres(
             "session_started": r["session_started"],
         })
 
-    # Bounded before/anchor/after context window, mirroring the SQLite path.
+    _attach_context(conn, decode_content, matches)
+    return matches
+
+
+def _attach_context(conn: Any, decode_content, matches: List[Dict[str, Any]]) -> None:
+    """Add bounded before/anchor/after context window to each match in-place."""
     for match in matches:
         try:
             ctx_rows = conn.execute(
@@ -835,8 +1093,6 @@ def search_messages_postgres(
             ]
         except Exception:
             match["context"] = []
-
-    return matches
 
 
 # ---------------------------------------------------------------------------
