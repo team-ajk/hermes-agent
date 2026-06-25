@@ -205,7 +205,7 @@ the *Retired* section at the bottom with the upstream PR/commit reference.
 ### D10 — feat(gateway): `X-Hermes-User-Id` header → agent `user_id` on the api_server platform
 
 - **Status:** active, **candidate for upstream PR**.
-- **PR:** team-ajk/hermes-agent#PENDING
+- **PR:** team-ajk/hermes-agent#16
 - **Fork-local touchpoints:**
   - `gateway/platforms/api_server.py` — new `_parse_user_id_header()`
     (mirrors `_parse_session_key_header`'s auth/validation shape); a
