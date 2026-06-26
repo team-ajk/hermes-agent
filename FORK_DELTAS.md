@@ -229,7 +229,11 @@ the *Retired* section at the bottom with the upstream PR/commit reference.
   `X-Hermes-Session-Key`: the header is an impersonation surface, so it is
   rejected unless `API_SERVER_KEY` is configured; control chars and
   over-long values are rejected. Absent header ⇒ unchanged member-fallback
-  behaviour (fully backward compatible).
+  behaviour (fully backward compatible). Also adds `X-Hermes-User-Id` —
+  and the pre-existing siblings `X-Hermes-Session-Key` /
+  `X-Hermes-Session-Id` — to the CORS `Access-Control-Allow-Headers` list,
+  so browser clients can send any Hermes custom header without a preflight
+  failure (the sibling gap predated this PR; fixed here as the same class).
 - **Upstream disposition:** clean candidate for extraction. It closes a
   real cross-platform parity gap (api_server is the only platform missing
   user identity) and is independent of the janus plugin — any plugin or

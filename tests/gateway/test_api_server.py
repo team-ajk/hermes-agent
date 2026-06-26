@@ -3149,6 +3149,21 @@ class TestCORS:
         assert headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
         assert "POST" in headers["Access-Control-Allow-Methods"]
 
+    def test_cors_advertises_all_custom_request_headers(self):
+        """Invariant: every custom request header the api_server reads must be
+        advertised in Access-Control-Allow-Headers, or a browser client that
+        sends it fails CORS preflight before the request is ever made. Asserts
+        the relationship (read header → allowed header), not a frozen string."""
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        headers = adapter._cors_headers_for_origin("http://localhost:3000")
+        allowed = {
+            h.strip().lower()
+            for h in headers["Access-Control-Allow-Headers"].split(",")
+        }
+        # Custom headers the adapter parses from inbound requests.
+        for required in ("x-hermes-user-id", "x-hermes-session-key", "x-hermes-session-id"):
+            assert required in allowed, f"{required} read by server but not CORS-advertised"
+
     def test_cors_headers_for_origin_rejects_unknown_origin(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         assert adapter._cors_headers_for_origin("http://evil.example") is None
