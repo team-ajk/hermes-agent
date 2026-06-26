@@ -41,6 +41,7 @@ the *Retired* section at the bottom with the upstream PR/commit reference.
 | [D8](#d-8) | feat(plugins) | `system_prompt` plugin hook for dynamic system-prompt injection | open-upstream (witt3rd/hermes-agent#1) |
 | [D9](#d-9) | fix(docker) | Honor passwd home in container wrappers instead of hardcoding `/opt/data` | candidate-upstream |
 | [D10](#d-10) | feat(gateway) | `X-Hermes-User-Id` header → agent `user_id` on the api_server platform (interlocutor identity) | candidate-upstream |
+| [D11](#d-11) | fix(agent) | Allow ZWJ inside emoji grapheme clusters in context/memory/skills scanners | **pending upstream** — NousResearch/hermes-agent#12673 |
 
 ---
 
@@ -257,6 +258,46 @@ the *Retired* section at the bottom with the upstream PR/commit reference.
   memory provider keying on `agent._user_id` benefits. Depends conceptually
   on nothing fork-local; the consumer that motivated it is D8, but the
   mechanism is generic.
+
+<a id="d-11"></a>
+### D11 — fix(agent): allow ZWJ inside emoji grapheme clusters in context/memory/skills scanners
+
+- **Status:** active. **This is a forward-port of a pending upstream PR** —
+  see disposition below. Once the upstream PR merges this delta retires.
+- **Upstream PR:** [NousResearch/hermes-agent#12673](https://github.com/NousResearch/hermes-agent/pull/12673)
+  (open, authored by witt3rd). The upstream PR was also carried in the
+  witt3rd personal fork as branch `fix/emoji-zwj-scan-false-positive`.
+- **Fork-local touchpoints:**
+  - `utils.py` — new shared helper `find_unsafe_invisibles()`,
+    `_is_pictographic()`, `_zwj_in_emoji_context()`, and exported
+    `BLOCKLIST_INVISIBLES` constant.
+  - `tools/skills_guard.py` — `scan_file()` calls `find_unsafe_invisibles()`
+    instead of iterating `char in INVISIBLE_CHARS`.
+  - `tools/threat_patterns.py` — `scan_for_threats()` calls
+    `find_unsafe_invisibles()` instead of a raw set intersection.
+  - `tests/agent/test_prompt_builder.py` — 6 new test cases covering
+    legitimate emoji ZWJ sequences, injection ZWJ outside emoji, and
+    mixed content.
+- **Why:** The invisible-unicode blocklist in `scan_for_threats()` (and the
+  `skills_guard` scanner) categorically rejected ZWJ (`U+200D`). But ZWJ is
+  a required component of emoji grapheme clusters — any gendered emoji
+  (`🧙‍♂️`, `👩‍⚕️`), family emoji (`👨‍👩‍👧`), or multi-pictograph emoji uses
+  `char + ZWJ + char [+ VS16]`. Any context file (`SOUL.md`, `AGENTS.md`,
+  `.hermes.md`), memory entry, or skill file containing such emoji was
+  silently blocked with a `[BLOCKED: … contained potential prompt injection
+  (invisible unicode U+200D)]` message. The fix adds a shared helper
+  `find_unsafe_invisibles()` that whitelists ZWJ only when it sits between
+  two pictographic codepoints (skipping variation selectors), and rejects it
+  everywhere else — preserving full injection protection while allowing the
+  emoji that Janus substrate files use extensively (e.g. `🧙‍♂️` in SOUL.md).
+  Upstream PR #28589 had already fixed the same false-positive for the cron
+  prompt scanner; this PR completes the job for the three remaining scanners
+  and factors the logic into a single shared helper.
+- **Upstream disposition:** **pending upstream merge** as
+  [NousResearch/hermes-agent#12673](https://github.com/NousResearch/hermes-agent/pull/12673).
+  This fork-local copy is a forward-port to keep team-ajk current. When
+  the upstream PR merges, drop this branch, retire this entry, and pull
+  upstream normally.
 
 ## Retired
 
