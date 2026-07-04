@@ -7051,27 +7051,32 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
-        # Group context injection — Layer 1 (session-level, cache-stable).
+        # Group context injection — two layers, designed for token efficiency
+        # and prompt-cache safety.
         #
-        # When a message arrives in a group/supergroup, inject a structured
-        # group-context block into the channel_prompt so the agent knows:
-        #   - it is in a group conversation (not a 1:1 DM)
-        #   - the group name/id
-        #   - its own @mention name and user_id in this group
+        # Layer 1 (session-level, cache-stable) — group identity context.
+        # Injected into channel_prompt whenever chat_type == "group", regardless
+        # of whether from_user is present (anonymous admins, service-style updates,
+        # forwarded channel posts all carry group context even without a sender).
+        # The block content is stable for the life of the session (same group =
+        # same bot identity = same block), so it does not invalidate the prompt
+        # cache on subsequent messages.
         #
-        # This block is stable for the life of the session — it does not
-        # change per-message — so it is safe from a prompt-caching perspective.
-        # It is injected regardless of require_mention state.
+        # Layer 2 (per-message, sender prefix) — "[SenderName]: " prepended to
+        # message text when from_user is available.
+        # KNOWN LIMITATION: This prefix is embedded in adapter-built message text
+        # and therefore persists in the session transcript. The architecturally
+        # correct home for per-message attribution is the shared gateway inbound
+        # pipeline, not the platform adapter — the GroupContext sidecar design
+        # (see AMBIENT-ROOM-INTELLIGENCE.md) is the proper solution. Operators
+        # who enable both this patch and observe_unmentioned_group_messages should
+        # be aware of potential double-attribution on the same message if the
+        # gateway inbound pipeline also prefixes sender info. This Layer 2
+        # implementation is a stepping stone pending the sidecar landing.
         #
-        # Sender attribution (Layer 2) is handled separately: just the sender
-        # name is prepended to each message's text below, adding minimal
-        # per-message overhead without accumulating historical noise.
-        #
-        # Participant roster and roster-change events (Layer 3) are out of
-        # scope for this patch — roster tracking requires accumulation across
-        # messages and is deferred to a follow-up.
+        # Layer 3 (roster tracking / join-leave events) is out of scope here.
         msg_text = message.text or ""
-        if chat_type == "group" and user:
+        if chat_type == "group":
             bot = getattr(self, "_bot", None)
             bot_username = getattr(bot, "username", None) or "unknown"
             bot_id = getattr(bot, "id", None) or "unknown"
@@ -7087,9 +7092,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 if _channel_prompt
                 else group_prompt
             )
-            # Layer 2 — prepend sender name to this message's text only.
-            sender = user.full_name or str(user.id)
-            msg_text = f"[{sender}]: {msg_text}"
+            # Layer 2 — sender prefix, only when sender is known.
+            if user:
+                sender = user.full_name or str(user.id)
+                msg_text = f"[{sender}]: {msg_text}"
 
         return MessageEvent(
             text=msg_text,
