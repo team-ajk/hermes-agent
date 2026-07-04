@@ -7051,31 +7051,27 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
-        # Group context injection — two layers, designed for token efficiency
-        # and prompt-cache safety.
+        # Group context injection — Layer 1 only (session-level, cache-stable).
         #
-        # Layer 1 (session-level, cache-stable) — group identity context.
         # Injected into channel_prompt whenever chat_type == "group", regardless
         # of whether from_user is present (anonymous admins, service-style updates,
-        # forwarded channel posts all carry group context even without a sender).
+        # and forwarded channel posts all carry group context even without a sender).
         # The block content is stable for the life of the session (same group =
         # same bot identity = same block), so it does not invalidate the prompt
         # cache on subsequent messages.
         #
-        # Layer 2 (per-message, sender prefix) — "[SenderName]: " prepended to
-        # message text when from_user is available.
-        # KNOWN LIMITATION: This prefix is embedded in adapter-built message text
-        # and therefore persists in the session transcript. The architecturally
-        # correct home for per-message attribution is the shared gateway inbound
-        # pipeline, not the platform adapter — the GroupContext sidecar design
-        # (see AMBIENT-ROOM-INTELLIGENCE.md) is the proper solution. Operators
-        # who enable both this patch and observe_unmentioned_group_messages should
-        # be aware of potential double-attribution on the same message if the
-        # gateway inbound pipeline also prefixes sender info. This Layer 2
-        # implementation is a stepping stone pending the sidecar landing.
+        # Per-message sender attribution (formerly Layer 2) is intentionally
+        # omitted here. The gateway already prepends "[user_name] " to message
+        # text at gateway/run.py:8557-8558 for shared multi-user sessions via
+        # is_shared_multi_user_session(). Adding a second prefix in the adapter
+        # produces double-attribution ("[Alice]: [Alice] message"). The correct
+        # design for richer per-message attribution is the GroupContext sidecar
+        # on MessageEvent (see AMBIENT-ROOM-INTELLIGENCE.md) — a platform-neutral
+        # approach that the gateway handles once rather than each adapter
+        # re-implementing independently.
         #
-        # Layer 3 (roster tracking / join-leave events) is out of scope here.
-        msg_text = message.text or ""
+        # Participant roster and roster-change events (Layer 3) are out of scope
+        # for this patch and deferred to a follow-up.
         if chat_type == "group":
             bot = getattr(self, "_bot", None)
             bot_username = getattr(bot, "username", None) or "unknown"
@@ -7092,13 +7088,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 if _channel_prompt
                 else group_prompt
             )
-            # Layer 2 — sender prefix, only when sender is known.
-            if user:
-                sender = user.full_name or str(user.id)
-                msg_text = f"[{sender}]: {msg_text}"
 
         return MessageEvent(
-            text=msg_text,
+            text=message.text or "",
             message_type=msg_type,
             source=source,
             raw_message=message,

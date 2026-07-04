@@ -42,7 +42,7 @@ the *Retired* section at the bottom with the upstream PR/commit reference.
 | [D9](#d-9) | fix(docker) | Honor passwd home in container wrappers instead of hardcoding `/opt/data` | candidate-upstream |
 | [D10](#d-10) | feat(gateway) | `X-Hermes-User-Id` header → agent `user_id` on the api_server platform (interlocutor identity) | candidate-upstream |
 | [D11](#d-11) | fix(agent) | Allow ZWJ inside emoji grapheme clusters in context/memory/skills scanners | **pending upstream** — NousResearch/hermes-agent#12673 |
-| [D12](#d-12) | feat(telegram) | Inject group context (session-level channel_prompt + per-message sender prefix) into dispatched Telegram group messages | **pending upstream** — stepping stone toward `GroupContext` sidecar |
+| [D12](#d-12) | feat(telegram) | Inject group context (session-level `channel_prompt` only) into dispatched Telegram group messages | **pending upstream** — stepping stone toward `GroupContext` sidecar |
 
 ---
 
@@ -314,20 +314,22 @@ that became redundant.
 - **PR:** team-ajk/hermes-agent#20
 - **Fork-local touchpoints:**
   - `plugins/platforms/telegram/adapter.py` — `_build_message_event()`:
-    when `chat_type == "group"` and `user` is present, injects a structured
-    group-context block into `channel_prompt` (Layer 1, session-level,
-    cache-stable) and prepends `[SenderName]: ` to message text (Layer 2,
-    per-message, sender only).
+    when `chat_type == "group"`, injects a structured group-context block
+    into `channel_prompt` (Layer 1, session-level, cache-stable). No
+    per-message sender prefix — the gateway already handles sender attribution
+    at `gateway/run.py:8557-8558` via `is_shared_multi_user_session()`;
+    adapter-level prefixing would produce double-attribution.
 - **Why:** Without this patch, agents in Telegram groups receive raw message
-  text with no group context and no sender attribution. They cannot distinguish
-  a group conversation from a 1:1 DM, and implicitly treat every message as
-  coming from their primary member. This is the foundational patch for
-  multi-being group presence on Telegram — the hexis disposition (see
-  AMBIENT-ROOM-INTELLIGENCE.md) requires the agent to know it is in a group
-  and who is speaking before it can meaningfully decide whether to respond.
-  The `channel_prompt` block is structurally stable (same group = same content),
-  which preserves Hermes's per-conversation prompt caching semantics. The patch
-  is additive: no existing DM or channel behavior is affected.
+  text with no group context. They cannot distinguish a group conversation
+  from a 1:1 DM and implicitly treat every message as coming from their
+  primary member. This is the foundational patch for multi-being group
+  presence on Telegram — the hexis disposition (see AMBIENT-ROOM-INTELLIGENCE.md)
+  requires the agent to know it is in a group before it can meaningfully decide
+  whether to respond. Per-message sender attribution is already handled by
+  the gateway (`gateway/run.py:8557-8558`). The `channel_prompt` block is
+  structurally stable (same group = same content), which preserves Hermes's
+  per-conversation prompt caching semantics. The patch is additive: no
+  existing DM or channel behavior is affected.
 - **Known design debt:** The injection logic is baked into the Telegram adapter
   — the architecturally correct design is a `GroupContext` sidecar on
   `MessageEvent` (a structured envelope any platform populates, processed once
