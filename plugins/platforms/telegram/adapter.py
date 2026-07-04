@@ -7051,8 +7051,48 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        # Group context injection — Layer 1 (session-level, cache-stable).
+        #
+        # When a message arrives in a group/supergroup, inject a structured
+        # group-context block into the channel_prompt so the agent knows:
+        #   - it is in a group conversation (not a 1:1 DM)
+        #   - the group name/id
+        #   - its own @mention name and user_id in this group
+        #
+        # This block is stable for the life of the session — it does not
+        # change per-message — so it is safe from a prompt-caching perspective.
+        # It is injected regardless of require_mention state.
+        #
+        # Sender attribution (Layer 2) is handled separately: just the sender
+        # name is prepended to each message's text below, adding minimal
+        # per-message overhead without accumulating historical noise.
+        #
+        # Participant roster and roster-change events (Layer 3) are out of
+        # scope for this patch — roster tracking requires accumulation across
+        # messages and is deferred to a follow-up.
+        msg_text = message.text or ""
+        if chat_type == "group" and user:
+            bot = getattr(self, "_bot", None)
+            bot_username = getattr(bot, "username", None) or "unknown"
+            bot_id = getattr(bot, "id", None) or "unknown"
+            group_name = chat.title or str(chat.id)
+            group_prompt = (
+                f"You are in a Telegram group: {group_name}\n"
+                f"Your identity in this group: @{bot_username} (user_id={bot_id})\n"
+                "Multiple people may be present. Respond only when your voice "
+                "genuinely adds something — not to every message."
+            )
+            _channel_prompt = (
+                f"{_channel_prompt}\n\n{group_prompt}"
+                if _channel_prompt
+                else group_prompt
+            )
+            # Layer 2 — prepend sender name to this message's text only.
+            sender = user.full_name or str(user.id)
+            msg_text = f"[{sender}]: {msg_text}"
+
         return MessageEvent(
-            text=message.text or "",
+            text=msg_text,
             message_type=msg_type,
             source=source,
             raw_message=message,
