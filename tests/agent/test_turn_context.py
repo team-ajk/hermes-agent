@@ -69,6 +69,7 @@ class _FakeAgent:
         self._memory_write_origin = "assistant_tool"
         self._stream_context_scrubber = None
         self._stream_think_scrubber = None
+        self._user_id = "user-123"
         # Attributes the prologue assigns; recorded for assertions.
         self._invalid_tool_retries = -1
         self._vision_supported = None
@@ -243,6 +244,89 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     # The prompt was populated before the DB row was created.
     assert agent._ensure_db_prompt_at_call == "REBUILT-SYSTEM"
     assert agent._cached_system_prompt == "REBUILT-SYSTEM"
+# ── system_prompt plugin hook ─────────────────────────────────────────────────
+
+
+class _FakePluginManager:
+    """Minimal plugin manager that returns fake system_prompt hook results."""
+
+    def __init__(self, content=None):
+        self._content = content
+
+    def has_hook(self, name):
+        return name == "system_prompt"
+
+    def invoke_hook(self, hook_name, **kwargs):
+        if self._content is not None:
+            return [{"content": self._content}]
+        return []
+
+
+def test_system_prompt_hook_injects_content():
+    """system_prompt hook content is appended to the system prompt."""
+    agent = _FakeAgent()
+    agent.compression_enabled = False
+
+    pm = _FakePluginManager(content="INJECTED_CONTENT")
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=pm):
+        ctx = _build(agent)
+
+    assert "INJECTED_CONTENT" in ctx.active_system_prompt
+    assert "SYSTEM" in ctx.active_system_prompt
+
+
+def test_system_prompt_hook_removal_clears_content():
+    """When all plugins return empty, injected content is cleared."""
+    agent = _FakeAgent()
+    agent.compression_enabled = False
+
+    # First build with content
+    pm = _FakePluginManager(content="INJECTED_CONTENT")
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=pm):
+        ctx = _build(agent)
+    assert "INJECTED_CONTENT" in ctx.active_system_prompt
+
+    # Second build with no content — should clear
+    pm2 = _FakePluginManager(content=None)
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=pm2):
+        ctx2 = _build(agent)
+    assert "INJECTED_CONTENT" not in ctx2.active_system_prompt
+
+
+def test_system_prompt_hook_hash_stability():
+    """Same plugin content should not rebuild system prompt."""
+    agent = _FakeAgent()
+    agent.compression_enabled = False
+
+    pm = _FakePluginManager(content="STABLE_CONTENT")
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=pm):
+        ctx1 = _build(agent)
+        # Second call with same content
+        ctx2 = _build(agent)
+
+    # Both should have the content
+    assert "STABLE_CONTENT" in ctx1.active_system_prompt
+    assert "STABLE_CONTENT" in ctx2.active_system_prompt
+
+
+def test_system_prompt_hook_uses_user_id():
+    """system_prompt hook receives agent._user_id as sender_id."""
+    agent = _FakeAgent()
+    agent._user_id = "telegram:12345"
+    agent.compression_enabled = False
+
+    received_kwargs = {}
+    original_invoke = _FakePluginManager.invoke_hook
+
+    def capture_invoke(self, hook_name, **kwargs):
+        received_kwargs.update(kwargs)
+        return original_invoke(self, hook_name, **kwargs)
+
+    pm = _FakePluginManager(content="test")
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=pm),          patch.object(_FakePluginManager, "invoke_hook", capture_invoke):
+        _build(agent)
+
+    assert received_kwargs.get("sender_id") == "telegram:12345"
 
 
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────

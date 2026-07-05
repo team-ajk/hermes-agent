@@ -2852,6 +2852,19 @@ DEFAULT_CONFIG = {
     # reports 384MB+ databases with 68K+ messages, which slows down FTS5
     # inserts, /resume listing, and insights queries.
     "sessions": {
+        # Durable session/state backend selector. "sqlite" (default) keeps the
+        # single-file state.db. "postgres" routes session/state storage to an
+        # external PostgreSQL database, opt-in for installs where the single-file
+        # backend is unsuitable. The PostgreSQL connection string is supplied via
+        # postgres_dsn (or an env override) and carries its own TLS/credential
+        # settings.
+        "state_backend": "sqlite",
+        # PostgreSQL connection string (DSN), consulted only when state_backend
+        # is "postgres". Empty by default. The DSN is passed through unchanged to
+        # the driver, so sslmode, host, port, and credentials all come from this
+        # value. May also be supplied via the HERMES_STATE_DATABASE_URL or
+        # HERMES_STATE_POSTGRES_DSN environment variables.
+        "postgres_dsn": "",
         # When true, prune ended sessions older than retention_days once
         # per (roughly) min_interval_hours at CLI/gateway/cron startup.
         # Only touches ended sessions — active sessions are always preserved.

@@ -185,6 +185,14 @@ VALID_HOOKS: Set[str] = {
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
     "pre_approval_request",
     "post_approval_response",
+    # System prompt hook. Fired on every turn AFTER the base system prompt is
+    # built/restored and after any context compression. Plugins return
+    # {"content": <str>} to contribute content to the system prompt. The framework
+    # computes a SHA-256 hash of the combined plugin content and only rebuilds
+    # the system prompt when the hash differs from the previous injection.
+    # No manual invalidation API is needed — changes are detected automatically.
+    # Kwargs: agent, session_id, sender_id, platform, conversation_history.
+    "system_prompt",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
     # transitions state, AFTER the change is committed to the board DB (so the
     # hook always sees durable state and a slow plugin can never hold the
