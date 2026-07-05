@@ -96,7 +96,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # HTML-scraping logic that rotates frequently in patch releases; an exact
     # pin would require bumping after every DDG-side rate-limit evasion release.
     # The floor is the last verified-working release (9.14.4, 2026-06-18).
-    "search.ddgs": ("ddgs>=9.14.4",),
+    "search.ddgs": ("ddgs>=9.14.4,<10",),
     "search.exa": ("exa-py==2.10.2",),
     "search.firecrawl": ("firecrawl-py==4.17.0",),
     "search.parallel": ("parallel-web==0.4.2",),
