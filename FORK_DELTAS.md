@@ -42,6 +42,7 @@ the *Retired* section at the bottom with the upstream PR/commit reference.
 | [D9](#d-9) | fix(docker) | Honor passwd home in container wrappers instead of hardcoding `/opt/data` | candidate-upstream |
 | [D10](#d-10) | feat(gateway) | `X-Hermes-User-Id` header → agent `user_id` on the api_server platform (interlocutor identity) | candidate-upstream |
 | [D11](#d-11) | fix(agent) | Allow ZWJ inside emoji grapheme clusters in context/memory/skills scanners | **pending upstream** — NousResearch/hermes-agent#12673 |
+| [D12](#d-12) | fix(deps) | Add `ddgs` to `LAZY_DEPS` + `pyproject.toml` extras (web search regression prevention) | candidate-upstream |
 
 ---
 
@@ -258,6 +259,34 @@ the *Retired* section at the bottom with the upstream PR/commit reference.
   memory provider keying on `agent._user_id` benefits. Depends conceptually
   on nothing fork-local; the consumer that motivated it is D8, but the
   mechanism is generic.
+
+<a id="d-12"></a>
+### D12 — fix(deps): add `ddgs` to `LAZY_DEPS` + `pyproject.toml` extras
+
+**Shape:** fix(deps)  
+**Files touched:**
+- `tools/lazy_deps.py`
+- `pyproject.toml`
+
+**Why:** `ddgs` (DuckDuckGo HTML-scrape search, no API key) was installed
+in-session via `uv pip install` when the web_search regression (kitchen-table#1434)
+was fixed, but was never added to the dependency manifest. On the next container
+rebuild, the package drops and the regression silently returns (kitchen-table#1439).
+
+This delta adds `ddgs>=9.14.4` to:
+- `LAZY_DEPS["search.ddgs"]` in `tools/lazy_deps.py` — enables
+  `ensure("search.ddgs")` programmatic lazy-install, parallel to how the other
+  search backends (`search.exa`, `search.firecrawl`, `search.parallel`) are declared
+- `[project.optional-dependencies]` in `pyproject.toml` as the `ddgs` extra — gives
+  packagers and `uv sync --extra ddgs` a declared handle to install it eagerly
+
+Uses a floor-pin (`>=9.14.4`) rather than exact-pin because ddgs ships HTML-scraping
+evasion logic that rotates frequently in patch releases; an exact pin would require
+a manifest bump on every DDG-side rate-limit evasion release.
+
+**Upstream disposition:** candidate-upstream — the `search.ddgs` entry in
+`lazy_deps.py` is straightforwardly useful upstream; the floor-pin rationale may
+prompt discussion. Filed via kitchen-table#1439.
 
 <a id="d-11"></a>
 ### D11 — fix(agent): allow ZWJ inside emoji grapheme clusters in context/memory/skills scanners

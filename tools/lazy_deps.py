@@ -88,6 +88,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "provider.azure_identity": ("azure-identity==1.25.3",),
 
     # ─── Web search backends ───────────────────────────────────────────────
+    # ddgs: DuckDuckGo HTML-scrape search provider (no API key required).
+    # Managed via `hermes tools` post_setup, but also registered here so
+    # `ensure("search.ddgs")` works programmatically and so container rebuilds
+    # do not silently drop the package (kitchen-table#1439).
+    # Uses a floor-pin (>=) rather than an exact pin because ddgs ships
+    # HTML-scraping logic that rotates frequently in patch releases; an exact
+    # pin would require bumping after every DDG-side rate-limit evasion release.
+    # The floor is the last verified-working release (9.14.4, 2026-06-18).
+    "search.ddgs": ("ddgs>=9.14.4",),
     "search.exa": ("exa-py==2.10.2",),
     "search.firecrawl": ("firecrawl-py==4.17.0",),
     "search.parallel": ("parallel-web==0.4.2",),
