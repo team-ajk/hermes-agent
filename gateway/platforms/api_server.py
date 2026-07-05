@@ -543,7 +543,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-User-Id, X-Hermes-Session-Key, X-Hermes-Session-Id",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-User-Id, X-Hermes-Session-Key, X-Hermes-Session-Id, X-Hermes-Group-Id, X-Hermes-Group-Name, X-Hermes-Sender-Display",
 }
 
 
@@ -1097,6 +1097,65 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         return raw, None
+
+    def _parse_group_context_headers(
+        self, request: "web.Request", gateway_user_id: Optional[str] = None
+    ) -> Optional["GroupContext"]:
+        """Extract X-Hermes-Group-* headers and return a GroupContext sidecar.
+
+        Reads three optional headers that any caller (e.g. Spire UI's
+        dispatchAmbient) can supply to signal a group/multi-user context:
+
+          X-Hermes-Group-Id      — stable group identifier (room_id, chat_id…)
+          X-Hermes-Group-Name    — human-readable group name (optional)
+          X-Hermes-Sender-Display — display name of the message sender (optional)
+
+        Returns None when X-Hermes-Group-Id is absent — the caller is a
+        plain 1:1 or programmatic session and no group context is injected.
+
+        Does not require API key authentication: the headers carry no identity
+        claim that could enable impersonation (group_id is metadata, not an
+        auth credential). Sender display name is decorative context only.
+
+        All values are sanitized before use — these strings are embedded into
+        the (system) prompt block, so control characters / newlines would be a
+        prompt-injection and log/formatting hazard. Values containing
+        \\r/\\n/\\x00 or exceeding the length cap are dropped (treated as absent)
+        rather than passed through.
+        """
+        from gateway.platforms.base import GroupContext
+
+        def _clean(header_name: str) -> Optional[str]:
+            raw = request.headers.get(header_name, "").strip()
+            if not raw:
+                return None
+            if re.search(r'[\r\n\x00]', raw):
+                logger.warning(
+                    "%s dropped: contains control characters", header_name
+                )
+                return None
+            if len(raw) > self._MAX_SESSION_HEADER_LEN:
+                logger.warning(
+                    "%s dropped: exceeds %d chars",
+                    header_name, self._MAX_SESSION_HEADER_LEN,
+                )
+                return None
+            return raw
+
+        group_id = _clean("X-Hermes-Group-Id")
+        if not group_id:
+            return None
+        return GroupContext(
+            platform="api_server",
+            group_id=group_id,
+            group_name=_clean("X-Hermes-Group-Name"),
+            sender_display=(
+                _clean("X-Hermes-Sender-Display")
+                or gateway_user_id
+                or None
+            ),
+        )
+
 
     def _ensure_session_db(self):
         """Lazily initialise and return the shared SessionDB instance.
@@ -1721,6 +1780,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_user_id, uid_err = self._parse_user_id_header(request)
         if uid_err is not None:
             return uid_err
+        group_context = self._parse_group_context_headers(request, gateway_user_id)
         session_id = request.match_info["session_id"]
         _, err = self._get_existing_session_or_404(session_id)
         if err:
@@ -1742,6 +1802,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             gateway_session_key=gateway_session_key,
             gateway_user_id=gateway_user_id,
+            group_context=group_context,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -1769,6 +1830,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_user_id, uid_err = self._parse_user_id_header(request)
         if uid_err is not None:
             return uid_err
+        group_context = self._parse_group_context_headers(request, gateway_user_id)
         session_id = request.match_info["session_id"]
         _, err = self._get_existing_session_or_404(session_id)
         if err:
@@ -1837,6 +1899,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
                     gateway_user_id=gateway_user_id,
+                    group_context=group_context,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -1975,6 +2038,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_user_id, uid_err = self._parse_user_id_header(request)
         if uid_err is not None:
             return uid_err
+        group_context = self._parse_group_context_headers(request, gateway_user_id)
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -2142,6 +2206,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 gateway_user_id=gateway_user_id,
+                group_context=group_context,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3874,6 +3939,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         gateway_user_id: Optional[str] = None,
+        group_context: Optional["GroupContext"] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3897,8 +3963,40 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id or "",
             )
             try:
+                # Build group identity block from sidecar and prepend to
+                # ephemeral_system_prompt (Layer 1 injection for api_server path,
+                # which bypasses gateway/run.py's MessageEvent processing).
+                _effective_esp = ephemeral_system_prompt
+                if group_context is not None:
+                    # Defensive normalization: collapse any control chars to
+                    # single-line before embedding into the system prompt.
+                    # Headers are already validated at parse time, but system-
+                    # prompt injection is higher-impact than user-message
+                    # injection, so we strip \r/\n/\x00 here as belt-and-suspenders.
+                    def _oneline(s):
+                        if not s:
+                            return s
+                        return re.sub(r'[\r\n\x00]+', ' ', s).strip()
+                    _g_name = _oneline(group_context.group_name)
+                    _g_id = _oneline(group_context.group_id)
+                    _g_sender = _oneline(group_context.sender_display)
+                    _g_platform = _oneline(group_context.platform)
+                    _parts = [
+                        f"You are in a {_g_platform} group: {_g_name or _g_id}",
+                    ]
+                    if _g_sender:
+                        _parts.append(f"Current speaker: {_g_sender}")
+                    _parts.append(
+                        "Multiple people may be present. "
+                        "Respond only when your voice genuinely adds something."
+                    )
+                    _group_block = "\n".join(_parts)
+                    _effective_esp = (
+                        f"{_effective_esp}\n\n{_group_block}"
+                        if _effective_esp else _group_block
+                    )
                 agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    ephemeral_system_prompt=_effective_esp,
                     session_id=session_id,
                     stream_delta_callback=stream_delta_callback,
                     tool_progress_callback=tool_progress_callback,
