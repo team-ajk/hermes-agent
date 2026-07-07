@@ -48,6 +48,7 @@ AUTHOR_MAP = {
     "witt3rd@witt3rd.com": "witt3rd",  # Donald Thompson (fork maintainer) — fork-local
     "forge@witt3rd.com": "forge-witt3rd",  # Forge (Donald's Janus, forge-witt3rd account) — fork-local
     "sevak@team-ajk.janus": "sevak-ms",  # Sevak (Mohak's Janus, sevak-ms account) — fork-local
+    "pipers_scanner_3c@icloud.com": "sevak-ms",  # Mohak Shroff (sevak-ms GitHub account) — fork-local
     "jeevesassistant00@gmail.com": "jeeves-assistant",  # PR #50771 (computer-use CuaDriver vision capture routing)
     "21178861+ScotterMonk@users.noreply.github.com": "ScotterMonk",  # PR #50145 salvage (cron output truncation: adapter-aware chunking, #50126)
     "rrandqua@gmail.com": "TutkuEroglu",  # PR #50481 salvage (AGENTS.md stale token-lock adapter path)
