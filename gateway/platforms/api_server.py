@@ -4480,6 +4480,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route = self._resolve_route(body.get("model"))
 
         async def _run_and_close():
+            _tts_owns_sentinel = False
             try:
                 self._set_run_status(run_id, "running")
                 agent = self._create_agent(
@@ -4586,47 +4587,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    # Voice mode: generate TTS audio and include base64-encoded bytes
-                    # in the SSE event so the caller (spire-ui in a separate container)
-                    # receives the audio in-band — a filesystem path would be meaningless
-                    # across container boundaries.
-                    tts_audio_b64: Optional[str] = None
-                    if _voice_mode and final_response:
-                        try:
-                            from tools.tts_tool import check_tts_requirements, text_to_speech_tool
-                            import base64 as _b64
-                            import json as _json
-                            import os as _os
-                            if check_tts_requirements():
-                                _tts_result = await asyncio.get_running_loop().run_in_executor(
-                                    None, text_to_speech_tool, final_response
-                                )
-                                _tts_data = _json.loads(_tts_result) if isinstance(_tts_result, str) else {}
-                                _tts_path = _tts_data.get("file_path")
-                                if _tts_path and _os.path.exists(_tts_path):
-                                    # Read + unlink in the executor — file I/O must not
-                                    # block the event loop, especially for large audio files.
-                                    def _read_and_delete(path: str) -> str:
-                                        try:
-                                            with open(path, "rb") as _f:
-                                                data = _b64.b64encode(_f.read()).decode()
-                                        finally:
-                                            try:
-                                                _os.unlink(path)
-                                            except Exception:
-                                                pass
-                                        return data
-                                    tts_audio_b64 = await asyncio.get_running_loop().run_in_executor(
-                                        None, _read_and_delete, _tts_path
-                                    )
-                        except Exception as _tts_err:
-                            logger.warning("[api_server] Voice TTS failed: %s", _tts_err)
+
+                    # Emit run.completed immediately — do NOT await TTS here.
+                    # Awaiting TTS blocks _run_and_close from returning, which
+                    # holds the per-(session, Janus) active-run slot and prevents
+                    # back-to-back dispatches from the same caller.
                     q.put_nowait({
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
-                        **({"audio_base64": tts_audio_b64} if tts_audio_b64 else {}),
                         "usage": usage,
                     })
                     self._set_run_status(
@@ -4636,6 +4606,61 @@ class APIServerAdapter(BasePlatformAdapter):
                         usage=usage,
                         last_event="run.completed",
                     )
+
+                    # Voice mode: generate TTS in the background and emit a
+                    # follow-up run.tts_audio event with base64-encoded audio.
+                    # The sentinel (None) is put into q AFTER TTS completes so
+                    # the SSE stream stays open long enough to deliver it.
+                    if _voice_mode and final_response:
+                        async def _emit_tts_audio(
+                            _run_id: str = run_id,
+                            _text: str = final_response,
+                        ) -> None:
+                            try:
+                                from tools.tts_tool import check_tts_requirements, text_to_speech_tool
+                                import base64 as _b64
+                                import json as _json
+                                import os as _os
+                                if not check_tts_requirements():
+                                    return
+                                _tts_result = await asyncio.get_running_loop().run_in_executor(
+                                    None, text_to_speech_tool, _text
+                                )
+                                _tts_data = _json.loads(_tts_result) if isinstance(_tts_result, str) else {}
+                                _tts_path = _tts_data.get("file_path")
+                                if not (_tts_path and _os.path.exists(_tts_path)):
+                                    return
+                                def _read_and_delete(path: str) -> str:
+                                    try:
+                                        with open(path, "rb") as _f:
+                                            data = _b64.b64encode(_f.read()).decode()
+                                    finally:
+                                        try:
+                                            _os.unlink(path)
+                                        except Exception:
+                                            pass
+                                    return data
+                                audio_b64 = await asyncio.get_running_loop().run_in_executor(
+                                    None, _read_and_delete, _tts_path
+                                )
+                                q.put_nowait({
+                                    "event": "run.tts_audio",
+                                    "run_id": _run_id,
+                                    "timestamp": time.time(),
+                                    "audio_base64": audio_b64,
+                                })
+                            except Exception as _tts_err:
+                                logger.warning("[api_server] Voice TTS failed: %s", _tts_err)
+                            finally:
+                                # Close the SSE stream now that TTS is done.
+                                try:
+                                    q.put_nowait(None)
+                                except Exception:
+                                    pass
+
+                        asyncio.ensure_future(_emit_tts_audio())
+                        # _emit_tts_audio owns the sentinel — suppress the one below.
+                        _tts_owns_sentinel = True
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
@@ -4680,11 +4705,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     unregister_gateway_notify(approval_session_key)
                 except Exception:
                     pass
-                # Sentinel: signal SSE stream to close
-                try:
-                    q.put_nowait(None)
-                except Exception:
-                    pass
+                # Sentinel: signal SSE stream to close (skipped if TTS task owns it)
+                if not _tts_owns_sentinel:
+                    try:
+                        q.put_nowait(None)
+                    except Exception:
+                        pass
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)

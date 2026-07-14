@@ -59,10 +59,9 @@ async def _collect_run_completed(cli, run_id: str) -> dict:
 class TestVoiceModeInRuns:
 
     @pytest.mark.asyncio
-    async def test_voice_body_flag_calls_tts_and_includes_audio_base64(self, tmp_path):
-        """message_type='voice' in body → TTS fires, audio_base64 in run.completed."""
+    async def test_voice_body_flag_calls_tts_and_emits_tts_audio_event(self, tmp_path):
+        """message_type='voice' in body → TTS fires, run.tts_audio event emitted after run.completed."""
         adapter = _make_adapter()
-        # Write a tiny valid WAV to a real temp file so the code can read it
         fake_wav = tmp_path / "tts_out.mp3"
         fake_wav.write_bytes(b"RIFF\x24\x00\x00\x00WAVEfmt ")
         fake_tts = json.dumps({"file_path": str(fake_wav), "text": "hello from forge"})
@@ -80,12 +79,25 @@ class TestVoiceModeInRuns:
                 )
                 assert resp.status == 202
                 run_id = (await resp.json())["run_id"]
-                await asyncio.sleep(0.3)
-                ev = await _collect_run_completed(cli, run_id)
 
-        assert ev.get("event") == "run.completed"
-        assert "audio_base64" in ev
-        assert len(ev["audio_base64"]) > 0
+                # Collect all events — stream closes after TTS (run.tts_audio then sentinel)
+                events = []
+                async with cli.get(f"/v1/runs/{run_id}/events") as sse:
+                    assert sse.status == 200
+                    async for raw in sse.content:
+                        line = raw.decode().strip()
+                        if line.startswith("data:"):
+                            ev = json.loads(line[5:])
+                            events.append(ev)
+
+        completed = next((e for e in events if e.get("event") == "run.completed"), None)
+        assert completed is not None
+        assert "audio_base64" not in completed  # slot released before TTS
+
+        tts_ev = next((e for e in events if e.get("event") == "run.tts_audio"), None)
+        assert tts_ev is not None, "run.tts_audio event not received"
+        assert "audio_base64" in tts_ev
+        assert len(tts_ev["audio_base64"]) > 0
         mock_tts.assert_called_once()
 
     @pytest.mark.asyncio
