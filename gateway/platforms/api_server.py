@@ -4604,12 +4604,21 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _tts_data = _json.loads(_tts_result) if isinstance(_tts_result, str) else {}
                                 _tts_path = _tts_data.get("file_path")
                                 if _tts_path and _os.path.exists(_tts_path):
-                                    with open(_tts_path, "rb") as _f:
-                                        tts_audio_b64 = _b64.b64encode(_f.read()).decode()
-                                    try:
-                                        _os.unlink(_tts_path)
-                                    except Exception:
-                                        pass
+                                    # Read + unlink in the executor — file I/O must not
+                                    # block the event loop, especially for large audio files.
+                                    def _read_and_delete(path: str) -> str:
+                                        try:
+                                            with open(path, "rb") as _f:
+                                                data = _b64.b64encode(_f.read()).decode()
+                                        finally:
+                                            try:
+                                                _os.unlink(path)
+                                            except Exception:
+                                                pass
+                                        return data
+                                    tts_audio_b64 = await asyncio.get_running_loop().run_in_executor(
+                                        None, _read_and_delete, _tts_path
+                                    )
                         except Exception as _tts_err:
                             logger.warning("[api_server] Voice TTS failed: %s", _tts_err)
                     q.put_nowait({

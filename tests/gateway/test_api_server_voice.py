@@ -1,9 +1,9 @@
 """Tests for voice mode in POST /v1/runs (D13).
 
 Covers:
-- message_type='voice' in body → TTS called, audio_path in run.completed SSE event
+- message_type='voice' in body → TTS called, audio_base64 in run.completed SSE event
 - X-Hermes-Voice: 'true' header → TTS called
-- Normal run (no voice flag) → TTS not called, no audio_path
+- Normal run (no voice flag) → TTS not called, no audio_base64 in event
 """
 import asyncio
 import json
@@ -129,7 +129,7 @@ class TestVoiceModeInRuns:
                 ev = await _collect_run_completed(cli, run_id)
 
         assert ev.get("event") == "run.completed"
-        assert "audio_path" not in ev
+        assert "audio_base64" not in ev
         mock_tts.assert_not_called()
 
     @pytest.mark.asyncio
