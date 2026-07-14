@@ -545,7 +545,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-User-Id, X-Hermes-Session-Key, X-Hermes-Session-Id",
 }
 
 
@@ -1137,9 +1137,56 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
-    # ------------------------------------------------------------------
-    # Session DB helper
-    # ------------------------------------------------------------------
+    def _parse_user_id_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract and validate the ``X-Hermes-User-Id`` header.
+
+        The user id is the inbound sender's stable identity (e.g. a member
+        canonical like ``donald``). It becomes the agent's ``user_id`` so
+        plugins can resolve who is speaking — the same role ``source.user_id``
+        plays for every other gateway platform.
+
+        Returns ``(user_id, None)`` on success (absent/empty header → ``None``),
+        or ``(None, error_response)`` on validation failure.
+
+        Security: accepting a caller-supplied sender identity is an
+        impersonation surface (a client could claim to be any interlocutor),
+        so — exactly like ``X-Hermes-Session-Key`` — it requires API-key
+        authentication. Without a configured ``API_SERVER_KEY`` the header is
+        rejected rather than trusted.
+        """
+        raw = request.headers.get("X-Hermes-User-Id", "").strip()
+        if not raw:
+            return None, None
+
+        if not self._api_key:
+            logger.warning(
+                "X-Hermes-User-Id rejected: no API key configured. "
+                "Set API_SERVER_KEY to enable sender identity."
+            )
+            return None, web.json_response(
+                _openai_error(
+                    "X-Hermes-User-Id requires API key authentication. "
+                    "Configure API_SERVER_KEY to enable this feature."
+                ),
+                status=403,
+            )
+
+        # Reject control characters (header-injection on any echo path).
+        if re.search(r'[\r\n\x00]', raw):
+            return None, web.json_response(
+                {"error": {"message": "Invalid user id", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        if len(raw) > self._MAX_SESSION_HEADER_LEN:
+            return None, web.json_response(
+                {"error": {"message": "User id too long", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        return raw, None
 
     def _ensure_session_db(self):
         """Lazily initialise and return the shared SessionDB instance.
@@ -1241,6 +1288,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        gateway_user_id: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1261,6 +1309,15 @@ class APIServerAdapter(BasePlatformAdapter):
         routing).  When set — and no session ``/model`` override exists for
         this session — its model/provider/api_key/base_url override the
         global defaults for this agent instance only.
+
+        ``gateway_user_id`` is the inbound sender's stable identity (via
+        the ``X-Hermes-User-Id`` header). Every other gateway platform sets
+        the agent's ``user_id`` from ``source.user_id`` (Telegram id,
+        Discord id, etc.); the API-server platform had no equivalent, so
+        plugins that resolve who-is-speaking from ``agent._user_id`` (e.g.
+        the janus interlocutor ``system_prompt`` hook) always fell back to
+        the member. Threading it here gives web-originated callers the same
+        per-sender identity every other platform already carries.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -1342,6 +1399,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # Pass gateway_user_id into the constructor (not post-init mutation)
+        # so per-user memory provider scoping — initialised inside init_agent
+        # from agent._user_id — sees the correct identity. Post-construction
+        # assignment is too late: by then MemoryManager.initialize_all() has
+        # already run with user_id=None. Parity with every other gateway
+        # platform, which passes user_id=source.user_id to AIAgent.
+        # Empty/None leaves the prior member-fallback behaviour unchanged.
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -1352,6 +1416,7 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
+            user_id=gateway_user_id,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
@@ -1881,6 +1946,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        gateway_user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
         session_id = request.match_info["session_id"]
         _, err = self._get_existing_session_or_404(session_id)
         if err:
@@ -1901,6 +1969,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            gateway_user_id=gateway_user_id,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -1925,6 +1994,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        gateway_user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
         session_id = request.match_info["session_id"]
         _, err = self._get_existing_session_or_404(session_id)
         if err:
@@ -1992,6 +2064,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    gateway_user_id=gateway_user_id,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2127,6 +2200,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        gateway_user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -2279,6 +2355,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                gateway_user_id=gateway_user_id,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2299,6 +2376,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                gateway_user_id=gateway_user_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3209,6 +3287,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        gateway_user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
 
         # Parse request body
         try:
@@ -3366,6 +3447,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                gateway_user_id=gateway_user_id,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3400,6 +3482,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                gateway_user_id=gateway_user_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -4031,6 +4114,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        gateway_user_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4067,6 +4151,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    gateway_user_id=gateway_user_id,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
@@ -4175,6 +4260,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        gateway_user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
 
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
@@ -4295,6 +4383,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    gateway_user_id=gateway_user_id,
                 )
                 self._active_run_agents[run_id] = agent
 

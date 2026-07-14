@@ -57,6 +57,7 @@ MAX_SCAN_CHARS = 65_536
 # near-misses.  Eight filler words is enough for the intended obfuscation
 # bypasses without introducing unbounded repetition.
 _FILLER = r"(?:\w+\s+){0,8}"
+from utils import find_unsafe_invisibles
 
 # Each entry: (regex, pattern_id, scope)
 # scope ∈ {"all", "context", "strict"}
@@ -233,7 +234,11 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     # since normalisation can strip some of these codepoints.
     char_set = set(content)
     invisible_hits = char_set & INVISIBLE_CHARS
-    for ch in invisible_hits:
+    # Invisible unicode. ZWJ (U+200D) inside an emoji grapheme cluster
+    # (🧙‍♂️, 👨‍👩‍👧) is legitimate and allowed; ZWJ between non-pictographic
+    # chars and every other blocklisted invisible is flagged on any
+    # occurrence. See utils.find_unsafe_invisibles.
+    for ch in find_unsafe_invisibles(content, INVISIBLE_CHARS):
         findings.append(f"invisible_unicode_U+{ord(ch):04X}")
 
     # Normalise to NFKC so full-width / compatibility Unicode variants
