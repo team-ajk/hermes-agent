@@ -356,9 +356,12 @@ that became redundant.
   `message_type: "voice"` in the request body (or `X-Hermes-Voice: true` header)
   is the api_server equivalent of receiving a voice note on Telegram. The outbound
   side — generate TTS, return the audio — mirrors exactly what the messaging gateways
-  already do. The only delivery difference is that the audio travels in-band as
-  `audio_base64` in the `run.completed` SSE event (rather than via `sendVoice`),
-  because the caller is a server-to-server HTTP client, not a chat platform.
+  already do. The only delivery difference is the transport: audio is emitted
+  as a separate `run.tts_audio` SSE event (carrying `audio_base64`) *after*
+  `run.completed` fires, rather than via `sendVoice`. `run.completed` is kept
+  free of audio so the active-run slot is released before TTS generation begins,
+  enabling back-to-back dispatches. The caller is a server-to-server HTTP client,
+  not a chat platform.
 - **Why inline rather than via MessageType.VOICE:**
   `/v1/runs` calls `agent.run_conversation()` directly, bypassing the `MessageEvent`
   pipeline. `MessageType.VOICE` and `_should_auto_tts_for_chat` live in the platform

@@ -1,7 +1,7 @@
 """Tests for voice mode in POST /v1/runs (D13).
 
 Covers:
-- message_type='voice' in body → TTS called, audio_base64 in run.completed SSE event
+- message_type='voice' in body → TTS called, audio_base64 in separate run.tts_audio SSE event
 - X-Hermes-Voice: 'true' header → TTS called
 - Normal run (no voice flag) → TTS not called, no audio_base64 in event
 """
