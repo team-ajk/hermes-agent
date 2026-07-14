@@ -30,6 +30,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _redact_api_error_text,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -48,6 +49,34 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+
+# ---------------------------------------------------------------------------
+# _redact_api_error_text — guards every outward error site (envelopes, SSE
+# error events, cron-endpoint 500 bodies) that routes raw exception text to
+# authenticated HTTP clients. #37733
+# ---------------------------------------------------------------------------
+
+
+class TestRedactApiErrorText:
+    def test_masks_secret_value_but_preserves_structure(self):
+        secret = "sk-api-server-leak-1234567890"
+        out = _redact_api_error_text(Exception(f"auth failed OPENAI_API_KEY={secret}"))
+        assert secret not in out
+        assert "OPENAI_API_KEY=" in out
+
+    def test_redacts_regardless_of_global_redaction_setting(self):
+        # force=True must mask even when global redaction is disabled.
+        secret = "sk-forced-redaction-0987654321"
+        with patch("agent.redact._REDACT_ENABLED", False):
+            out = _redact_api_error_text(Exception(f"boom AWS_SECRET_ACCESS_KEY={secret}"))
+        assert secret not in out
+
+    def test_limit_truncates_after_redaction(self):
+        assert len(_redact_api_error_text("x" * 500, limit=50)) == 50
+
+    def test_clean_text_passes_through_unchanged(self):
+        assert _redact_api_error_text("Job not found") == "Job not found"
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +400,50 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["max_iterations"] == 200
 
+    def test_create_agent_handles_fallback_model_kwarg_collision(self, monkeypatch):
+        """When the primary provider auth-fails, _resolve_runtime_agent_kwargs()
+        returns a runtime dict that carries its own ``model`` key. _create_agent
+        must pop it and let it override the config model — otherwise the explicit
+        ``model=`` collides with ``**runtime_kwargs`` and every request 500s with
+        "got multiple values for keyword argument 'model'"."""
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        # Runtime dict carries its own 'model' (the fallback provider's model).
+        # _create_agent must pop it and use it as the effective model. If the
+        # pop regresses, AIAgent(model=..., **runtime_kwargs) raises TypeError
+        # ("got multiple values for keyword argument 'model'").
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+                "model": "anthropic/claude-fallback",  # collides if not popped
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "primary/model")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda: {}))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 100)
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        # Must not raise TypeError on the duplicate 'model' kwarg.
+        agent = adapter._create_agent(session_id="test")
+        assert isinstance(agent, FakeAgent)
+        assert captured.get("provider") == "openrouter"
+        # The runtime dict's model overrides the config model — mirrors the
+        # native gateway fallback path.
+        assert captured.get("model") == "anthropic/claude-fallback"
+
     def test_create_agent_sets_user_id_from_gateway_user_id(self, monkeypatch):
         """gateway_user_id must land on agent._user_id so the interlocutor
         resolution (system_prompt hook) can identify the inbound sender —
@@ -391,13 +464,20 @@ class TestAdapterInit:
         monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
         monkeypatch.setattr(
             "gateway.run._resolve_runtime_agent_kwargs",
-            lambda: {"provider": "openai", "base_url": "https://example.test/v1", "api_mode": "chat_completions"},
+            lambda: {
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
         )
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5")
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "primary/model")
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
-        monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda: {}))
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {}),
+        )
         monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
-        monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 100)
+        monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
         monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
@@ -464,6 +544,106 @@ class TestUserIdHeader:
         assert uid is None
         assert err is not None
         assert err.status == 400
+
+
+# ---------------------------------------------------------------------------
+# X-Hermes-Group-* header parsing (GroupContext sidecar)
+# ---------------------------------------------------------------------------
+
+
+class TestGroupContextHeaders:
+    def _adapter(self, api_key=None):
+        cfg = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(cfg)
+        adapter._api_key = api_key
+        return adapter
+
+    def _request(self, headers):
+        class FakeRequest:
+            def __init__(self, headers):
+                self.headers = headers
+        return FakeRequest(headers)
+
+    def test_absent_group_id_returns_none(self):
+        # No X-Hermes-Group-Id → not a group context; return None.
+        adapter = self._adapter()
+        ctx = adapter._parse_group_context_headers(self._request({}))
+        assert ctx is None
+
+    def test_group_id_only_activates_context(self):
+        adapter = self._adapter()
+        ctx = adapter._parse_group_context_headers(
+            self._request({"X-Hermes-Group-Id": "room-42"})
+        )
+        assert ctx is not None
+        assert ctx.platform == "api_server"
+        assert ctx.group_id == "room-42"
+        assert ctx.group_name is None
+
+    def test_full_headers_populate_context(self):
+        adapter = self._adapter()
+        ctx = adapter._parse_group_context_headers(
+            self._request({
+                "X-Hermes-Group-Id": "room-42",
+                "X-Hermes-Group-Name": "The Green Room",
+                "X-Hermes-Sender-Display": "Alice",
+            })
+        )
+        assert ctx.group_id == "room-42"
+        assert ctx.group_name == "The Green Room"
+        assert ctx.sender_display == "Alice"
+
+    def test_no_auth_required(self):
+        # Group metadata carries no impersonation risk, so — unlike
+        # X-Hermes-User-Id — it does NOT require API_SERVER_KEY.
+        adapter = self._adapter(api_key=None)
+        ctx = adapter._parse_group_context_headers(
+            self._request({"X-Hermes-Group-Id": "room-42"})
+        )
+        assert ctx is not None
+
+    def test_sender_display_falls_back_to_gateway_user_id(self):
+        adapter = self._adapter()
+        ctx = adapter._parse_group_context_headers(
+            self._request({"X-Hermes-Group-Id": "room-42"}),
+            gateway_user_id="donald",
+        )
+        assert ctx.sender_display == "donald"
+
+    def test_control_chars_in_group_id_drop_context(self):
+        # Group id is embedded into the system prompt — control chars are a
+        # prompt-injection hazard. A malformed group id drops the whole context.
+        adapter = self._adapter()
+        ctx = adapter._parse_group_context_headers(
+            self._request({"X-Hermes-Group-Id": "room\n42"})
+        )
+        assert ctx is None
+
+    def test_control_chars_in_optional_fields_drop_that_field(self):
+        # Malformed optional fields are dropped individually; group_id survives.
+        adapter = self._adapter()
+        ctx = adapter._parse_group_context_headers(
+            self._request({
+                "X-Hermes-Group-Id": "room-42",
+                "X-Hermes-Group-Name": "bad\nname",
+                "X-Hermes-Sender-Display": "bad\x00sender",
+            })
+        )
+        assert ctx is not None
+        assert ctx.group_id == "room-42"
+        assert ctx.group_name is None
+        assert ctx.sender_display is None
+
+    def test_overlong_values_dropped(self):
+        adapter = self._adapter()
+        ctx = adapter._parse_group_context_headers(
+            self._request({
+                "X-Hermes-Group-Id": "room-42",
+                "X-Hermes-Group-Name": "y" * 300,
+            })
+        )
+        assert ctx is not None
+        assert ctx.group_name is None
 
 
 # ---------------------------------------------------------------------------
@@ -759,12 +939,21 @@ class TestHealthDetailedEndpoint:
                 assert data["gateway_drainable"] is False
 
     @pytest.mark.asyncio
-    async def test_health_detailed_does_not_require_auth(self, auth_adapter):
-        """Health detailed endpoint should be accessible without auth, like /health."""
+    async def test_health_detailed_requires_auth(self, auth_adapter):
+        """Detailed health must not leak runtime state without Bearer auth."""
         app = _create_app(auth_adapter)
         with patch("gateway.status.read_runtime_status", return_value=None):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
+                assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_allows_authenticated_request(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        headers = {"Authorization": f"Bearer {auth_adapter._api_key}"}
+        with patch("gateway.status.read_runtime_status", return_value={"gateway_state": "running"}):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed", headers=headers)
                 assert resp.status == 200
 
 
@@ -2159,6 +2348,33 @@ class TestResponsesEndpoint:
             assert resp.status == 500
 
     @pytest.mark.asyncio
+    async def test_result_error_fallback_is_redacted(self, adapter):
+        raw_secret = "sk-responses-leak-1234567890"
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "",
+                        "error": f"provider auth failed OPENAI_API_KEY={raw_secret}",
+                        "messages": [],
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "Hello"},
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            body = json.dumps(data)
+            assert raw_secret not in body
+            assert "OPENAI_API_KEY=" in body
+            assert data["output"][0]["content"][0]["text"] != f"provider auth failed OPENAI_API_KEY={raw_secret}"
+
+    @pytest.mark.asyncio
     async def test_invalid_input_type_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3062,6 +3278,35 @@ class TestChatCompletionsAgentIncomplete:
             assert resp.headers.get("X-Hermes-Partial") == "true"
 
     @pytest.mark.asyncio
+    async def test_hard_failure_redacts_secret_like_error_text(self, adapter):
+        raw_secret = "sk-api-server-leak-1234567890"
+        mock_result = {
+            "final_response": "",
+            "completed": False,
+            "partial": False,
+            "failed": True,
+            "error": f"provider auth failed OPENAI_API_KEY={raw_secret}",
+            "messages": [],
+            "api_calls": 1,
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hello"}]},
+                )
+
+            assert resp.status == 502
+            data = await resp.json()
+            body = json.dumps(data)
+            assert raw_secret not in body
+            assert raw_secret not in resp.headers.get("X-Hermes-Error", "")
+            assert "OPENAI_API_KEY=" in body
+            assert data["error"]["hermes"]["failed"] is True
+
+    @pytest.mark.asyncio
     async def test_failure_with_no_text_returns_502_error_envelope(self, adapter):
         """No usable assistant text + failure → 502 with OpenAI error envelope.
 
@@ -3479,6 +3724,24 @@ class TestSessionIdHeader:
             assert call_kwargs["session_id"] == "my-session-123"
 
     @pytest.mark.asyncio
+    async def test_traversal_session_id_header_rejected(self, auth_adapter):
+        """Security (#5958): a path-traversal X-Hermes-Session-Id must be
+        rejected with 400 so it can't reach the filesystem artifact paths
+        (session snapshot / request dump) and escape the sessions dir."""
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                for bad in ("../../../../etc/pwned", "/abs/path", "..\\win"):
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        headers={"X-Hermes-Session-Id": bad, "Authorization": "Bearer sk-secret"},
+                        json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]},
+                    )
+                    assert resp.status == 400, f"{bad!r} should be rejected"
+                # The agent is never invoked for a rejected ID.
+                assert mock_run.call_count == 0
+
+    @pytest.mark.asyncio
     async def test_provided_session_id_loads_history_from_db(self, auth_adapter):
         """When X-Hermes-Session-Id is provided, history comes from SessionDB not request body."""
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
@@ -3717,3 +3980,278 @@ class TestSessionKeyHeader:
             assert resp.status == 200
             data = await resp.json()
             assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
+
+
+# ---------------------------------------------------------------------------
+# Per-client model routing (model_routes)
+# ---------------------------------------------------------------------------
+
+
+def _make_routing_adapter(routes) -> APIServerAdapter:
+    """Create an adapter with model_routes configured."""
+    config = PlatformConfig(enabled=True, extra={"model_routes": routes})
+    return APIServerAdapter(config)
+
+
+def _patch_create_agent_runtime(monkeypatch, captured: dict, fake_agent_cls):
+    """Stub out every external dependency of _create_agent."""
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent_cls)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_key": "sk-global",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "global/model")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda: {})
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None)
+    )
+    monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+
+class TestModelRoutesParsing:
+    def test_valid_routes_are_parsed(self):
+        routes = {"minimax-m2": {"model": "minimax/minimax-m1", "provider": "openrouter"}}
+        adapter = _make_routing_adapter(routes)
+        assert adapter._model_routes == routes
+
+    def test_non_dict_routes_config_is_ignored(self):
+        adapter = _make_routing_adapter("not-a-dict")
+        assert adapter._model_routes == {}
+
+    def test_route_without_model_is_dropped(self):
+        adapter = _make_routing_adapter({"bad": {"provider": "openrouter"}})
+        assert adapter._model_routes == {}
+
+    def test_route_with_non_dict_value_is_dropped(self):
+        adapter = _make_routing_adapter({"bad": "gpt-5", "good": {"model": "openai/gpt-5"}})
+        assert set(adapter._model_routes) == {"good"}
+
+    def test_unknown_route_keys_are_stripped(self):
+        adapter = _make_routing_adapter(
+            {"a": {"model": "m", "provider": "p", "evil_extra": "x"}}
+        )
+        assert adapter._model_routes["a"] == {"model": "m", "provider": "p"}
+
+    def test_resolve_route_lookup(self):
+        adapter = _make_routing_adapter({"minimax-m2": {"model": "minimax/minimax-m1"}})
+        assert adapter._resolve_route("minimax-m2") == {"model": "minimax/minimax-m1"}
+        assert adapter._resolve_route("unknown-model") is None
+        assert adapter._resolve_route(None) is None
+        assert adapter._resolve_route(123) is None
+
+    def test_no_routes_configured(self):
+        adapter = _make_routing_adapter({})
+        assert adapter._resolve_route("hermes-agent") is None
+
+
+class TestModelRoutesModelsEndpoint:
+    @pytest.mark.asyncio
+    async def test_models_endpoint_lists_route_aliases(self):
+        routes = {
+            "minimax-m2": {"model": "minimax/minimax-m1", "provider": "openrouter"},
+            "gpt-5": {"model": "openai/gpt-5"},
+        }
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/models")
+            assert resp.status == 200
+            data = await resp.json()
+            ids = {m["id"] for m in data["data"]}
+            assert adapter._model_name in ids
+            assert "minimax-m2" in ids
+            assert "gpt-5" in ids
+
+    @pytest.mark.asyncio
+    async def test_models_endpoint_route_alias_fields_and_no_secrets(self):
+        routes = {"my-alias": {"model": "openai/gpt-5", "api_key": "sk-route-secret"}}
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/models")
+            data = await resp.json()
+            alias_entry = next(m for m in data["data"] if m["id"] == "my-alias")
+            assert alias_entry["root"] == "openai/gpt-5"
+            assert alias_entry["parent"] == adapter._model_name
+            # per-route api_key must never leak through the discovery endpoint
+            assert "sk-route-secret" not in json.dumps(data)
+
+
+class TestModelRoutesHandlers:
+    @pytest.mark.asyncio
+    async def test_chat_completions_passes_route_to_run_agent(self):
+        routes = {"minimax-m2": {"model": "minimax/minimax-m1", "provider": "openrouter"}}
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "minimax-m2",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                assert resp.status == 200
+                kwargs = mock_run.call_args.kwargs
+                assert kwargs.get("route") == {
+                    "model": "minimax/minimax-m1", "provider": "openrouter",
+                }
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_no_route_for_unknown_model(self):
+        adapter = _make_routing_adapter({"minimax-m2": {"model": "minimax/minimax-m1"}})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "unknown-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                assert resp.status == 200
+                assert mock_run.call_args.kwargs.get("route") is None
+
+    @pytest.mark.asyncio
+    async def test_responses_api_passes_route_to_run_agent(self):
+        routes = {"xiaozhi": {"model": "minimax/minimax-m1", "provider": "openrouter"}}
+        adapter = _make_routing_adapter(routes)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                resp = await cli.post("/v1/responses", json={
+                    "model": "xiaozhi",
+                    "input": "hello",
+                })
+                assert resp.status == 200
+                assert mock_run.call_args.kwargs.get("route") == {
+                    "model": "minimax/minimax-m1", "provider": "openrouter",
+                }
+
+
+class TestModelRoutesAgentCreation:
+    def test_route_overrides_model_and_credentials(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = _make_routing_adapter(
+            {"alias": {
+                "model": "minimax/minimax-m1",
+                "api_key": "sk-route",
+                "base_url": "https://route.example/v1",
+            }}
+        )
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        agent = adapter._create_agent(
+            session_id="s1", route=adapter._resolve_route("alias")
+        )
+
+        assert isinstance(agent, FakeAgent)
+        assert captured["model"] == "minimax/minimax-m1"
+        assert captured["api_key"] == "sk-route"
+        assert captured["base_url"] == "https://route.example/v1"
+
+    def test_route_provider_resolves_provider_credentials(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+            lambda provider: {
+                "provider": provider,
+                "api_key": f"sk-{provider}",
+                "base_url": f"https://{provider}.example/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+        adapter = _make_routing_adapter(
+            {"alias": {"model": "other/model", "provider": "otherprov"}}
+        )
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        adapter._create_agent(session_id="s1", route=adapter._resolve_route("alias"))
+
+        assert captured["model"] == "other/model"
+        assert captured["provider"] == "otherprov"
+        assert captured["api_key"] == "sk-otherprov"
+
+    def test_no_route_keeps_global_model(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = _make_routing_adapter({"alias": {"model": "other/model"}})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        adapter._create_agent(session_id="s1", route=None)
+
+        assert captured["model"] == "global/model"
+        assert captured["api_key"] == "sk-global"
+
+    def test_session_model_override_beats_route(self, monkeypatch):
+        """A user-issued /model on the session must win over static route config."""
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = _make_routing_adapter({"alias": {"model": "route/model", "api_key": "sk-route"}})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(
+            adapter,
+            "_session_model_override_for",
+            lambda key: {"model": "session/override-model"},
+        )
+
+        adapter._create_agent(session_id="s1", route=adapter._resolve_route("alias"))
+
+        # The route must NOT be applied — the session override path (global
+        # runtime here, since the gateway applies /model separately) wins.
+        assert captured["model"] == "global/model"
+        assert captured["api_key"] == "sk-global"
+
+    def test_session_override_lookup_reads_gateway_runner(self, monkeypatch):
+        """_session_model_override_for consults GatewayRunner._session_model_overrides."""
+        adapter = _make_routing_adapter({})
+
+        class FakeRunner:
+            _session_model_overrides = {"chan-1": {"model": "user/model"}}
+
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: FakeRunner())
+        assert adapter._session_model_override_for("chan-1") == {"model": "user/model"}
+        assert adapter._session_model_override_for("chan-2") is None
+        assert adapter._session_model_override_for(None) is None
