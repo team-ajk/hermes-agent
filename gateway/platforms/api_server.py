@@ -1502,11 +1502,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         Returns gateway state, connected platforms, PID, and uptime so the
         dashboard can display full status without needing a shared PID file or
-        /proc access.  Requires the same Bearer auth as other API routes.
+        /proc access.  No authentication required — this endpoint is used by
+        ACA health probes which cannot supply a Bearer token (ACA httpHeaders
+        value is plaintext-only; no secretRef support on probes). Keeping it
+        unauthenticated is safe: it exposes only gateway state metadata, not
+        session data or agent capabilities.
         """
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
 
         from gateway.status import (
             derive_gateway_busy,
