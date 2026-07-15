@@ -4431,11 +4431,11 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
 
-        # Voice mode: when message_type='voice' or X-Hermes-Voice header is set,
-        # emit run.completed immediately (releases the slot), then generate TTS
-        # audio in a background task and emit a separate run.tts_audio event.
+        # Voice mode: audio_base64 present (LiveKit path) or legacy header/field.
+        # When set: emit run.completed immediately, then TTS in a background task.
         _voice_mode = (
-            str(body.get("message_type", "")).lower() == "voice"
+            bool(body.get("audio_base64"))
+            or str(body.get("message_type", "")).lower() == "voice"
             or request.headers.get("X-Hermes-Voice", "").strip().lower()
             in _TRUE_REQUEST_BOOL_STRINGS
         )
@@ -4567,6 +4567,39 @@ class APIServerAdapter(BasePlatformAdapter):
                         "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                     }
                     return r, u
+
+                # STT: if audio_base64 was provided, transcribe it and use the
+                # transcript as user_message.  Emit run.transcript so chat-proxy
+                # can store it as kind="call_transcript" in the DB.
+                _audio_b64 = body.get("audio_base64")
+                if _audio_b64 and isinstance(_audio_b64, str):
+                    nonlocal user_message
+                    try:
+                        import base64 as _b64, tempfile as _tmp, os as _os
+                        from tools.transcription_tools import transcribe_audio as _transcribe
+                        _wav = _b64.b64decode(_audio_b64)
+                        with _tmp.NamedTemporaryFile(suffix=".wav", delete=False) as _f:
+                            _f.write(_wav)
+                            _tmp_path = _f.name
+                        try:
+                            _stt = await asyncio.get_running_loop().run_in_executor(
+                                None, _transcribe, _tmp_path
+                            )
+                        finally:
+                            try:
+                                _os.unlink(_tmp_path)
+                            except Exception:
+                                pass
+                        if _stt.get("success") and _stt.get("transcript"):
+                            user_message = _stt["transcript"]
+                            q.put_nowait({
+                                "event": "run.transcript",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                                "text": user_message,
+                            })
+                    except Exception as _stt_err:
+                        logger.warning("[api_server] STT failed: %s", _stt_err)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 # Check for structured failure (non-retryable client errors like

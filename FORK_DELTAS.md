@@ -343,34 +343,28 @@ that became redundant.
 
 ---
 
-### D13 — parity(api_server): voice mode in POST /v1/runs — closing the gap with messaging gateways
+### D13 — parity(api_server): voice roundtrip in POST /v1/runs — STT + TTS parity with messaging gateways
 
 - **Files:** `gateway/platforms/api_server.py`
-- **Status:** Active — introduced 2026-07-14 for Janus DM voice calls in spire-ui
+- **Status:** Active — introduced 2026-07-14 for Janus DM voice calls in spire-ui; STT leg added 2026-07-15
 - **What this is (parity, not net-new):**
-  The messaging gateway platforms (Telegram, etc.) already have a full voice loop:
-  inbound voice note → `MessageType.VOICE` → `_should_auto_tts_for_chat` fires →
-  TTS generates audio → platform sends a voice reply. The api_server platform had
-  all the same TTS infrastructure but no way to trigger it, because there is no
-  inbound message type concept on a raw HTTP endpoint. This change closes that gap.
-  `message_type: "voice"` in the request body (or `X-Hermes-Voice: true` header)
-  is the api_server equivalent of receiving a voice note on Telegram. The outbound
-  side — generate TTS, return the audio — mirrors exactly what the messaging gateways
-  already do. The only delivery difference is the transport: audio is emitted
-  as a separate `run.tts_audio` SSE event (carrying `audio_base64`) *after*
-  `run.completed` fires, rather than via `sendVoice`. `run.completed` is kept
-  free of audio so the active-run slot is released before TTS generation begins,
-  enabling back-to-back dispatches. The caller is a server-to-server HTTP client,
-  not a chat platform.
-- **Why inline rather than via MessageType.VOICE:**
+  The messaging gateways (Telegram, etc.) own the full voice loop: inbound audio →
+  STT → agent runs on transcript → TTS → audio reply. The api_server platform had
+  all the same TTS infrastructure but no inbound audio path. This delta closes both
+  gaps. **Inbound (STT):** when the caller sends `audio_base64` (WAV bytes), the
+  gateway decodes, writes a temp file, calls `transcribe_audio()`, sets
+  `user_message` to the transcript, and emits a `run.transcript` SSE event so
+  callers can surface what the user said. **Outbound (TTS):** `_voice_mode` is
+  inferred from `audio_base64` presence (or the legacy `message_type: "voice"` /
+  `X-Hermes-Voice: true` signals); when set, `run.completed` fires first (releasing
+  the active-run slot), then a background task generates TTS and emits
+  `run.tts_audio` carrying `audio_base64`.
+- **Why inline rather than via MessageType.VOICE / MessageEvent pipeline:**
   `/v1/runs` calls `agent.run_conversation()` directly, bypassing the `MessageEvent`
-  pipeline. `MessageType.VOICE` and `_should_auto_tts_for_chat` live in the platform
-  event path and are not reachable from this code path. TTS must be invoked inline
-  in `_run_and_close()` after `final_response` is known — the same place the event
-  is enqueued. This is an implementation detail, not a design difference; the intent
-  and user-visible behaviour are identical to the messaging gateway voice path.
-- **Upstream disposition:** Strong candidate for upstream once proven. The api_server
-  platform should have parity with messaging gateways for voice; this is a minimal
-  stepping stone. A cleaner upstream approach might unify the voice trigger across
-  all platform adapters (e.g. a shared `_maybe_tts_response()` in base.py), but
-  that refactor belongs in a dedicated PR with broader platform coverage.
+  pipeline. STT (`_enrich_message_with_transcription`) and TTS
+  (`_should_auto_tts_for_chat`) live in that pipeline and are unreachable here.
+  Both must be implemented inline in `_run_and_close()`. This is an implementation
+  detail; the intent and user-visible behaviour mirror the messaging gateway path.
+- **Upstream disposition:** Strong candidate for upstream once proven. A cleaner
+  approach might unify voice handling across adapters via a shared base.py hook,
+  but that belongs in a dedicated PR with broader platform coverage.
