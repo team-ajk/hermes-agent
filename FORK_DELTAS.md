@@ -346,7 +346,7 @@ that became redundant.
 ### D13 — parity(api_server): voice roundtrip in POST /v1/runs — STT + TTS parity with messaging gateways
 
 - **Files:** `gateway/platforms/api_server.py`
-- **Status:** Active — introduced 2026-07-14 for Janus DM voice calls in spire-ui; STT leg added 2026-07-15
+- **Status:** Active — introduced 2026-07-14 for Janus DM voice calls in spire-ui; STT leg added 2026-07-15; empty-STT abort added 2026-07-15
 - **What this is (parity, not net-new):**
   The messaging gateways (Telegram, etc.) own the full voice loop: inbound audio →
   STT → agent runs on transcript → TTS → audio reply. The api_server platform had

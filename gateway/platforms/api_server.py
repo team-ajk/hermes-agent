@@ -4568,9 +4568,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     }
                     return r, u
 
-                # STT: if audio_base64 was provided, transcribe it and use the
-                # transcript as user_message.  Emit run.transcript so chat-proxy
-                # can store it as kind="call_transcript" in the DB.
+                _stt_aborted = False
                 _audio_b64 = body.get("audio_base64")
                 if _audio_b64 and isinstance(_audio_b64, str):
                     nonlocal user_message
@@ -4598,8 +4596,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                 "timestamp": time.time(),
                                 "text": user_message,
                             })
+                        else:
+                            logger.info("[api_server] STT returned no transcript — skipping agent run")
+                            _stt_aborted = True
                     except Exception as _stt_err:
                         logger.warning("[api_server] STT failed: %s", _stt_err)
+                        _stt_aborted = True
+
+                if _stt_aborted:
+                    q.put_nowait(None)
+                    return
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 # Check for structured failure (non-retryable client errors like
