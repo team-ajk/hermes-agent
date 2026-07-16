@@ -714,6 +714,42 @@ def _cache_mcp_image_block(block) -> str:
     return f"MEDIA:{image_path}"
 
 
+def _extract_mcp_resource_block(block) -> Optional[Dict[str, Any]]:
+    """Extract an ``EmbeddedResource`` (MCP ``type: "resource"``) into a plain
+    ``{uri, mimeType, text|blob, _meta}`` dict, or ``None`` if not a resource.
+
+    An ``EmbeddedResource`` carries its payload under ``block.resource`` with no
+    top-level ``.text``, so the generic text-extraction path in the tool-result
+    loop misses it and it would otherwise be silently dropped. This is the
+    MCP-UI card shape: a ``UIResource`` whose ``resource.text`` is HTML and
+    ``resource.uri`` a ``ui://`` handle (mimeType ``text/html;profile=mcp-app``,
+    MCP-UI metadata under ``resource._meta`` — exposed as ``.meta`` in the mcp
+    python types, aliased to ``_meta`` on the wire).
+    """
+    if getattr(block, "type", None) != "resource":
+        return None
+    resource = getattr(block, "resource", None)
+    if resource is None:
+        return None
+    entry: Dict[str, Any] = {}
+    uri = getattr(resource, "uri", None)
+    if uri is not None:
+        entry["uri"] = str(uri)
+    mime = getattr(resource, "mimeType", None)
+    if mime:
+        entry["mimeType"] = mime
+    text = getattr(resource, "text", None)
+    blob = getattr(resource, "blob", None)
+    if text is not None:
+        entry["text"] = text
+    elif blob is not None:
+        entry["blob"] = blob
+    meta = getattr(resource, "meta", None)
+    if meta:
+        entry["_meta"] = meta
+    return entry or None
+
+
 # ---------------------------------------------------------------------------
 # Remote MCP URL validation
 # ---------------------------------------------------------------------------
@@ -3972,69 +4008,33 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if hasattr(block, "text") and block.text:
                     parts.append(block.text)
                     continue
-                # EmbeddedResource blocks (MCP `type: "resource"`) carry their
-                # payload under `block.resource`, NOT at the top level — so the
-                # `hasattr(block, "text")` check above never matches them and
-                # they were silently dropped. This is how MCP-UI ships a UI
-                # card: a `UIResource` is an EmbeddedResource whose
-                # `resource.text` is HTML and whose `resource.uri` is a
-                # `ui://` handle (mimeType `text/html;profile=mcp-app`, with
-                # MCP-UI metadata under `resource._meta`). Surface both the
-                # human-readable text (so the model sees the content) and the
-                # structured resource (so plugins — e.g. a canvas-drop
-                # `post_tool_call` hook — can reconstruct the real UIResource).
-                resource = getattr(block, "resource", None)
-                if getattr(block, "type", None) == "resource" and resource is not None:
-                    res_text = getattr(resource, "text", None)
-                    res_blob = getattr(resource, "blob", None)
-                    res_uri = getattr(resource, "uri", None)
-                    res_mime = getattr(resource, "mimeType", None)
-                    # `_meta` is exposed as the `.meta` attribute in the mcp
-                    # python types (aliased to `_meta` on the wire).
-                    res_meta = getattr(resource, "meta", None)
-                    entry: Dict[str, Any] = {}
-                    if res_uri is not None:
-                        entry["uri"] = str(res_uri)
-                    if res_mime:
-                        entry["mimeType"] = res_mime
-                    if res_text is not None:
-                        entry["text"] = res_text
-                    elif res_blob is not None:
-                        entry["blob"] = res_blob
-                    if res_meta:
-                        entry["_meta"] = res_meta
-                    if entry:
-                        embedded_resources.append(entry)
-                    # Also let the resource's own text flow into the
-                    # model-facing payload when present (rawHtml/text
-                    # resources); blob resources contribute structure only.
-                    if res_text:
-                        parts.append(res_text)
+                # EmbeddedResource blocks (MCP-UI cards etc.) carry their
+                # payload under `block.resource`, so the top-level `.text`
+                # check above misses them — extract explicitly or they drop.
+                resource = _extract_mcp_resource_block(block)
+                if resource is not None:
+                    embedded_resources.append(resource)
+                    if resource.get("text"):  # text resources also feed the model
+                        parts.append(resource["text"])
                     continue
                 image_tag = _cache_mcp_image_block(block)
                 if image_tag:
                     parts.append(image_tag)
             text_result = "\n".join(parts) if parts else ""
 
-            # Combine content + structuredContent + embedded resources when
-            # present. MCP spec: content is model-oriented (text),
-            # structuredContent is machine-oriented (JSON metadata). Embedded
-            # resources (UIResource cards etc.) are surfaced under `resources`
-            # so plugins can consume the structured `{uri, mimeType, text,
-            # _meta}` without re-parsing prose. For an AI agent, content is the
-            # primary payload; the others supplement it.
+            # MCP result channels: `content` is model-oriented (text),
+            # `structuredContent` is machine-oriented JSON, and embedded
+            # `resources` (UIResource cards) surface the structured
+            # {uri, mimeType, text|blob, _meta} for plugins to consume without
+            # re-parsing prose. Prior contract: with structuredContent and no
+            # text, `result` IS the structured content.
             structured = getattr(result, "structuredContent", None)
             payload: Dict[str, Any] = {"result": text_result}
             if structured is not None:
-                payload["structuredContent"] = structured
-                if not text_result:
-                    # Preserve the prior contract: when there is no text but
-                    # there is structuredContent, `result` IS the structured
-                    # content (not an empty string wrapper).
+                if text_result:
+                    payload["structuredContent"] = structured
+                else:
                     payload = {"result": structured}
-                    if embedded_resources:
-                        payload["resources"] = embedded_resources
-                    return json.dumps(payload, ensure_ascii=False)
             if embedded_resources:
                 payload["resources"] = embedded_resources
             return json.dumps(payload, ensure_ascii=False)
