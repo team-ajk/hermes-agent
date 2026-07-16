@@ -4374,11 +4374,14 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         raw_input = body.get("input")
-        if not raw_input:
+        _has_audio = bool(body.get("audio_base64"))
+        # Voice path: audio_base64 carries the utterance; the transcript becomes
+        # the input after STT, so 'input' is not required when audio is present.
+        if not raw_input and not _has_audio:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
+        if not user_message and not _has_audio:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
@@ -4431,11 +4434,11 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
 
-        # Voice mode: when message_type='voice' or X-Hermes-Voice header is set,
-        # emit run.completed immediately (releases the slot), then generate TTS
-        # audio in a background task and emit a separate run.tts_audio event.
+        # Voice mode: audio_base64 present (LiveKit path) or legacy header/field.
+        # When set: emit run.completed immediately, then TTS in a background task.
         _voice_mode = (
-            str(body.get("message_type", "")).lower() == "voice"
+            bool(body.get("audio_base64"))
+            or str(body.get("message_type", "")).lower() == "voice"
             or request.headers.get("X-Hermes-Voice", "").strip().lower()
             in _TRUE_REQUEST_BOOL_STRINGS
         )
@@ -4481,6 +4484,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route = self._resolve_route(body.get("model"))
 
         async def _run_and_close():
+            nonlocal user_message
             _tts_owns_sentinel = False
             try:
                 self._set_run_status(run_id, "running")
@@ -4567,6 +4571,61 @@ class APIServerAdapter(BasePlatformAdapter):
                         "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                     }
                     return r, u
+
+                _stt_aborted = False
+                _audio_b64 = body.get("audio_base64")
+                if _audio_b64 and isinstance(_audio_b64, str):
+                    try:
+                        import base64 as _b64, tempfile as _tmp, os as _os
+                        from tools.transcription_tools import transcribe_audio as _transcribe
+                        _wav = _b64.b64decode(_audio_b64)
+                        with _tmp.NamedTemporaryFile(suffix=".wav", delete=False) as _f:
+                            _f.write(_wav)
+                            _tmp_path = _f.name
+                        try:
+                            _stt = await asyncio.get_running_loop().run_in_executor(
+                                None, _transcribe, _tmp_path
+                            )
+                        finally:
+                            try:
+                                _os.unlink(_tmp_path)
+                            except Exception:
+                                pass
+                        if _stt.get("success") and _stt.get("transcript"):
+                            user_message = _stt["transcript"]
+                            q.put_nowait({
+                                "event": "run.transcript",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                                "text": user_message,
+                            })
+                        else:
+                            logger.info("[api_server] STT returned no transcript — skipping agent run")
+                            _stt_aborted = True
+                    except Exception as _stt_err:
+                        logger.warning("[api_server] STT failed: %s", _stt_err)
+                        _stt_aborted = True
+
+                if _stt_aborted:
+                    # Empty/failed STT: no utterance to run. Emit a terminal
+                    # run.completed with empty output so GET /v1/runs/{id} moves
+                    # off "running" and clients can distinguish a clean abort
+                    # from a network drop — then close the stream.
+                    q.put_nowait({
+                        "event": "run.completed",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "output": "",
+                        "usage": {},
+                    })
+                    self._set_run_status(
+                        run_id,
+                        "completed",
+                        output="",
+                        last_event="run.completed",
+                    )
+                    q.put_nowait(None)
+                    return
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 # Check for structured failure (non-retryable client errors like
