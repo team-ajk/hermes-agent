@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_SQL_POSTGRES = """
 CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER NOT NULL
+    version INTEGER NOT NULL UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -148,12 +148,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_session_key
-    ON sessions(session_key, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
-    ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
-    ON sessions(handoff_state, started_at);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
@@ -262,6 +256,13 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
         version=20,
         optional=True,
         sql=(
+            # Add unique constraint to schema_version so ON CONFLICT DO NOTHING
+            # works correctly for future version inserts. CREATE UNIQUE INDEX is
+            # used instead of ALTER TABLE ADD CONSTRAINT because the latter
+            # requires an explicit constraint name and is more verbose; both are
+            # equivalent for this purpose.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_schema_version_unique"
+            "    ON schema_version(version);\n"
             "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_key TEXT;\n"
             "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS chat_id TEXT;\n"
             "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS chat_type TEXT;\n"
