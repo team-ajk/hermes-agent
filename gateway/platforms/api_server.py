@@ -4374,11 +4374,14 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         raw_input = body.get("input")
-        if not raw_input:
+        _has_audio = bool(body.get("audio_base64"))
+        # Voice path: audio_base64 carries the utterance; the transcript becomes
+        # the input after STT, so 'input' is not required when audio is present.
+        if not raw_input and not _has_audio:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
+        if not user_message and not _has_audio:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
@@ -4481,6 +4484,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route = self._resolve_route(body.get("model"))
 
         async def _run_and_close():
+            nonlocal user_message
             _tts_owns_sentinel = False
             try:
                 self._set_run_status(run_id, "running")
@@ -4571,7 +4575,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 _stt_aborted = False
                 _audio_b64 = body.get("audio_base64")
                 if _audio_b64 and isinstance(_audio_b64, str):
-                    nonlocal user_message
                     try:
                         import base64 as _b64, tempfile as _tmp, os as _os
                         from tools.transcription_tools import transcribe_audio as _transcribe
@@ -4604,6 +4607,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         _stt_aborted = True
 
                 if _stt_aborted:
+                    # Empty/failed STT: no utterance to run. Emit a terminal
+                    # run.completed with empty output so GET /v1/runs/{id} moves
+                    # off "running" and clients can distinguish a clean abort
+                    # from a network drop — then close the stream.
+                    q.put_nowait({
+                        "event": "run.completed",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "output": "",
+                        "usage": {},
+                    })
+                    self._set_run_status(
+                        run_id,
+                        "completed",
+                        output="",
+                        last_event="run.completed",
+                    )
                     q.put_nowait(None)
                     return
 

@@ -165,3 +165,73 @@ class TestVoiceModeInRuns:
                 await asyncio.sleep(0.2)
 
         mock_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stt_empty_transcript_emits_terminal_completed(self):
+        """audio_base64 present but STT yields no transcript → agent NOT run,
+        a terminal run.completed (empty output) is emitted so the run leaves
+        'running', and the stream closes."""
+        import base64
+
+        adapter = _make_adapter()
+        audio_b64 = base64.b64encode(b"RIFF\x24\x00\x00\x00WAVEfmt ").decode()
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=_fake_agent()) as mock_create,
+            patch(
+                "tools.transcription_tools.transcribe_audio",
+                return_value={"success": True, "transcript": ""},
+            ) as mock_stt,
+        ):
+            app = _create_runs_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/runs", json={"audio_base64": audio_b64})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                ev = await _collect_run_completed(cli, run_id)
+
+        # Terminal event emitted with empty output, and the agent never RAN
+        # (run_conversation not invoked) — the run was aborted after STT.
+        assert ev.get("event") == "run.completed"
+        assert ev.get("output") == ""
+        mock_stt.assert_called_once()
+        mock_create.return_value.run_conversation.assert_not_called()
+        # Run status moved off "running".
+        status = adapter._run_statuses.get(run_id, {}).get("status")
+        assert status == "completed", f"expected completed, got {status!r}"
+
+    @pytest.mark.asyncio
+    async def test_stt_transcript_runs_agent_and_emits_transcript_event(self):
+        """audio_base64 + successful STT → transcript injected, agent runs,
+        run.transcript event emitted with the recognized text."""
+        import base64
+
+        adapter = _make_adapter()
+        audio_b64 = base64.b64encode(b"RIFF\x24\x00\x00\x00WAVEfmt ").decode()
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=_fake_agent()) as mock_create,
+            patch(
+                "tools.transcription_tools.transcribe_audio",
+                return_value={"success": True, "transcript": "what time is it"},
+            ) as mock_stt,
+        ):
+            app = _create_runs_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/runs", json={"audio_base64": audio_b64})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                events = []
+                async with cli.get(f"/v1/runs/{run_id}/events") as sse:
+                    assert sse.status == 200
+                    async for raw in sse.content:
+                        line = raw.decode().strip()
+                        if line.startswith("data:"):
+                            events.append(json.loads(line[5:]))
+
+        mock_stt.assert_called_once()
+        mock_create.assert_called_once()  # agent ran on the transcript
+        transcript_ev = next((e for e in events if e.get("event") == "run.transcript"), None)
+        assert transcript_ev is not None, "run.transcript event not received"
+        assert transcript_ev.get("text") == "what time is it"
