@@ -1348,7 +1348,7 @@ class SessionDB:
                         continue
                 # Non-lock error or retries exhausted — propagate.
                 raise
-except (Exception, sqlite3.DatabaseError) as exc:
+            except (Exception, sqlite3.DatabaseError) as exc:
                 # PostgreSQL surfaces write contention as generic Exception;
                 # SQLite corrupt FTS shadow tables raise DatabaseError.
                 # Corrupt FTS shadow tables make every write raise the
