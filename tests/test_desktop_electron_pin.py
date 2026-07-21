@@ -97,7 +97,7 @@ def test_lockfile_resolves_the_pinned_electron():
 
 
 DESKTOP_DIR = REPO_ROOT / "apps" / "desktop"
-ELECTRON_BUILDER_WRAPPER = DESKTOP_DIR / "scripts" / "run-electron-builder.cjs"
+ELECTRON_BUILDER_WRAPPER = DESKTOP_DIR / "scripts" / "run-electron-builder.mjs"
 
 
 def test_no_static_electron_dist_that_can_drift():
@@ -105,15 +105,15 @@ def test_no_static_electron_dist_that_can_drift():
     assert "electronDist" not in _desktop_pkg().get("build", {}), (
         "build.electronDist is hardcoded again. npm hoisting is non-deterministic, "
         "so a static path silently breaks packaging when the layout changes. Let "
-        "scripts/run-electron-builder.cjs resolve it dynamically instead."
+        "scripts/run-electron-builder.mjs resolve it dynamically instead."
     )
 
 
 def test_builder_script_routes_through_dynamic_resolver():
-    """npm run builder must invoke run-electron-builder.cjs, not bare electron-builder."""
+    """npm run builder must invoke run-electron-builder.mjs, not bare electron-builder."""
     builder = _desktop_pkg().get("scripts", {}).get("builder", "")
-    assert "run-electron-builder.cjs" in builder, (
-        f"the 'builder' script must run scripts/run-electron-builder.cjs, got "
+    assert "run-electron-builder.mjs" in builder, (
+        f"the 'builder' script must run scripts/run-electron-builder.mjs, got "
         f"{builder!r}"
     )
     assert ELECTRON_BUILDER_WRAPPER.is_file(), (
@@ -125,11 +125,11 @@ def test_resolver_uses_node_module_resolution():
     """Wrapper must resolve electron via require.resolve and pass -c.electronDist."""
     src = ELECTRON_BUILDER_WRAPPER.read_text(encoding="utf-8")
     assert 'require.resolve("electron/package.json")' in src, (
-        "run-electron-builder.cjs must resolve electron via "
+        "run-electron-builder.mjs must resolve electron via "
         "require.resolve('electron/package.json') to stay hoist-proof."
     )
     # And it must hand the resolved dist to electron-builder as an override.
     assert "-c.electronDist=" in src, (
-        "run-electron-builder.cjs must pass the resolved dist to electron-builder "
+        "run-electron-builder.mjs must pass the resolved dist to electron-builder "
         "via -c.electronDist."
     )

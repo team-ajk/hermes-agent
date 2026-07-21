@@ -4214,6 +4214,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # Hermes' MEDIA tag + cache_image_from_bytes) was the cleaner of
             # the two — plugs into existing infrastructure.
             parts: List[str] = []
+            resources: list[dict] = []
             for block in (result.content or []):
                 if hasattr(block, "text") and block.text:
                     parts.append(block.text)
@@ -4231,6 +4232,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # so document-oriented MCP tools appeared to return metadata
                 # only (enterprise customer report, 2026-07).
                 resource_text = _render_mcp_resource_block(block, server_name)
+                r = getattr(block, "resource", None)
+                if r is not None:
+                    resources.append({
+                        "uri": getattr(r, "uri", None),
+                        "mimeType": getattr(r, "mimeType", None),
+                        "text": getattr(r, "text", None),
+                        "blob": getattr(r, "blob", None),
+                        "_meta": getattr(r, "meta", None),
+                    })
                 if resource_text:
                     parts.append(resource_text)
                     continue
@@ -4263,6 +4273,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         "structuredContent": structured,
                     }, ensure_ascii=False)
                 return json.dumps({"result": structured}, ensure_ascii=False)
+            if resources:
+                return json.dumps({"result": text_result, "resources": resources}, ensure_ascii=False)
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():
