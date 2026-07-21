@@ -4280,7 +4280,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # is the primary payload; structuredContent supplements it.
             structured = getattr(result, "structuredContent", None)
             if structured is not None:
-                resp: dict = {"result": text_result, "structuredContent": structured}
+                if text_result:
+                    resp: dict = {"result": text_result, "structuredContent": structured}
+                    if resources:
+                        resp["resources"] = resources
+                    return json.dumps(resp, ensure_ascii=False)
+                # Empty text: structured content becomes the result (upstream contract)
+                resp = {"result": structured}
                 if resources:
                     resp["resources"] = resources
                 return json.dumps(resp, ensure_ascii=False)

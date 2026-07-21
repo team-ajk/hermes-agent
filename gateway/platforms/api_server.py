@@ -5375,11 +5375,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     unregister_gateway_notify(approval_session_key)
                 except Exception:
                     pass
-                # Sentinel: signal SSE stream to close
-                try:
-                    _put_event_if_active(None)
-                except Exception:
-                    pass
+                # Sentinel: signal SSE stream to close.
+                # When _tts_owns_sentinel is True the background TTS task
+                # owns the sentinel — skip it here so the SSE stream stays
+                # open long enough to deliver the run.tts_audio event.
+                if not _tts_owns_sentinel:
+                    try:
+                        _put_event_if_active(None)
+                    except Exception:
+                        pass
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
