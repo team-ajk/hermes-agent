@@ -84,7 +84,7 @@ the *Retired* section at the bottom with the upstream PR/commit reference.
 
 - **Status:** active, **candidate for upstream PR**.
 - **Commit:** `4fabaf579 fix(ci): add adkapx@gmail.com → adamkaplan to AUTHOR_MAP`
-- **Fork-local touchpoints:** the CI author-map file (one-line addition).
+- **Fork-local touchpoints:** `scripts/release.py` — one-line addition to `AUTHOR_MAP` dict. (Upstream moved AUTHOR_MAP from CI workflow to `scripts/release.py` in v0.19.)
 - **Why:** Without the map entry the CI bot misattributes commits from this
   email to a stranger. Pure mechanical fix.
 - **Upstream disposition:** trivial single-line PR upstream when convenient.
@@ -303,9 +303,19 @@ the *Retired* section at the bottom with the upstream PR/commit reference.
 
 ## Retired
 
-*Empty.* When an upstream PR merges a delta from above, move its entry here
+When an upstream PR merges a delta from above, move its entry here
 with the upstream commit/PR reference and the SHA of the fork-local commit
 that became redundant.
+
+### D11 — fix(agent): ZWJ emoji grapheme cluster scanner — **retired v2026.7.20**
+
+- Upstream merged equivalent fix in v0.19 (NousResearch/hermes-agent#12673 or equivalent).
+- Fork-local files `utils.py`, `tools/skills_guard.py`, `tools/threat_patterns.py` changes dropped; taking upstream.
+
+### D14 — fix(mcp): EmbeddedResource content blocks — **retired v2026.7.20**
+
+- Upstream v0.19 includes comprehensive `ResourceLink / EmbeddedResource / AudioContent` handling in `tools/mcp_tool.py` that fully supersedes the fork's `_extract_mcp_resource_block` helper.
+- Fork-local `tools/mcp_tool.py` changes dropped; taking upstream entirely.
 
 <a id="d-12"></a>
 ### D12 — feat(gateway): `GroupContext` sidecar for unified group context injection
@@ -377,7 +387,7 @@ that became redundant.
 
 - **Files:** `tools/mcp_tool.py` (result-assembly loop in `_make_tool_handler`'s
   `_call`), `tests/tools/test_mcp_embedded_resource.py` (new).
-- **Status:** active — introduced 2026-07-16.
+- **Status:** ~~active~~ → **RETIRED in v2026.7.20** — upstream v0.19 includes comprehensive EmbeddedResource/ResourceLink/AudioContent handling that supersedes this delta. Retirement: drop `tools/mcp_tool.py` fork changes; take upstream entirely.
 - **What this is (bug fix, general):** Hermes' native MCP client assembled a
   tool result by extracting only `block.text` and `ImageContent` blocks from
   the `CallToolResult`. An **`EmbeddedResource`** block (MCP `type: "resource"`)

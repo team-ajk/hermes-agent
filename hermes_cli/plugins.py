@@ -143,6 +143,8 @@ VALID_HOOKS: Set[str] = {
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
+    # D8: dynamic system-prompt injection hook (team-ajk fork-local)
+    "system_prompt",
     # Verification-loop gate. Fired once per turn when the agent has edited code
     # and is about to verify/finish (after the verify-on-stop guard). A callback
     # may keep the agent going — run a check, defer it, tidy the diff — instead
@@ -172,27 +174,21 @@ VALID_HOOKS: Set[str] = {
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
-    # command needs user approval -- fires BOTH for CLI-interactive prompts
-    # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
+    # command needs an approval decision -- fires for CLI-interactive prompts,
+    # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
     # Observers only: return values are ignored. Plugins cannot veto or
     # pre-answer an approval from these hooks (use pre_tool_call to block
     # a tool before it reaches approval).
     #
     # Kwargs for pre_approval_request:
     #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
-    #   session_key: str, surface: "cli" | "gateway"
+    #   session_key: str, surface: "cli" | "gateway" | "smart"
     # Kwargs for post_approval_response: same as above plus
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
+    #           | "smart_approve" | "smart_deny"
+    #   decided_by: "aux_llm"  -- only on surface="smart"
     "pre_approval_request",
     "post_approval_response",
-    # System prompt hook. Fired on every turn AFTER the base system prompt is
-    # built/restored and after any context compression. Plugins return
-    # {"content": <str>} to contribute content to the system prompt. The framework
-    # computes a SHA-256 hash of the combined plugin content and only rebuilds
-    # the system prompt when the hash differs from the previous injection.
-    # No manual invalidation API is needed — changes are detected automatically.
-    # Kwargs: agent, session_id, sender_id, platform, conversation_history.
-    "system_prompt",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
     # transitions state, AFTER the change is committed to the board DB (so the
     # hook always sees durable state and a slow plugin can never hold the
