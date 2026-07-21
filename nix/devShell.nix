@@ -42,15 +42,11 @@
         shellHook = ''
           ${combinedNonNpm}
           ${hermesNpmLib.mkNpmDevShellHook npmPackageJsonPaths}
-<<<<<<< HEAD
-          echo "Ready. Run 'hermes' to start."
-=======
 
           # for the devshell to pick up the src
           export HERMES_PYTHON_SRC_ROOT=$(git rev-parse --show-toplevel)
           echo "Hermes Agent dev shell in $HERMES_PYTHON_SRC_ROOT"
           echo "Ready. Run 'hermes' or 'sandbox hermes' to start."
->>>>>>> v2026.7.20
         '';
       };
     };

@@ -71,19 +71,6 @@ let
         pushd apps/desktop
           # typecheck :3
           npm exec tsc -b
-<<<<<<< HEAD
-          npm exec vite build
-
-          # simple-git is the electron main's external runtime dep.  It is not
-          # bundled into main.cjs; instead the stage-native-deps.cjs call above
-          # copies its closure to apps/desktop/build/native-deps/vendor/node_modules/,
-          # which installPhase ships into $out/native-deps/ — the same path the
-          # packaged app uses.  electron/git-review-ops.cjs resolves it from
-          # process.resourcesPath when the hoisted require() isn't reachable
-          # (see issue #52735).  node-pty's prebuilt is staged the same way;
-          # electron is provided by the runtime.  preload.cjs stays separate —
-          # Electron loads it via __dirname, not require().
-=======
 
           # build the renderer bundle
           # vite's emptyOutDir wipes dist/ on every run
@@ -111,7 +98,6 @@ let
           # Target platform/arch come from stdenv.hostPlatform, not the
           # build host's own process.platform/arch.
           node scripts/stage-native-deps.mjs ${targetPlatform} ${targetArch}
->>>>>>> v2026.7.20
         popd
 
         runHook postBuild
@@ -179,16 +165,6 @@ stdenv.mkDerivation {
     substituteInPlace $out/share/hermes-desktop/dist/electron-main.mjs \
       --replace-fail "process.resourcesPath" "'$out/share/hermes-desktop'"
 
-<<<<<<< HEAD
-    # git-review-ops.cjs has the same process.resourcesPath fallback for its
-    # staged simple-git dep (native-deps/vendor/node_modules/), so it needs the same
-    # rewrite — otherwise the require() fallback resolves against the electron
-    # dist's resources path and fails to load simple-git (issue #52735).
-    substituteInPlace $out/share/hermes-desktop/electron/git-review-ops.cjs \
-      --replace-fail "process.resourcesPath" "'$out/share/hermes-desktop'"
-
-=======
->>>>>>> v2026.7.20
     # Wrap the nixpkgs electron binary to launch our app.  Set
     # HERMES_DESKTOP_HERMES to the absolute path of the nix-built `hermes`
     # binary so the desktop's resolver step 4 ("existing Hermes CLI on

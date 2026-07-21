@@ -45,11 +45,7 @@ let
       dependency-groups = [ "all" ] ++ extraDependencyGroups;
     };
 
-<<<<<<< HEAD
-  hermesVenv = mkHermesVenv extraDependencyGroups;
-=======
   hermesVenv = (mkHermesVenv extraDependencyGroups).venv;
->>>>>>> v2026.7.20
 
   hermesNpmLib = callPackage ./lib.nix {
     inherit npm-lockfile-fix nodejs;
@@ -258,16 +254,6 @@ stdenv.mkDerivation (finalAttrs: {
       devDeps = runtimeDeps ++ [ devPython ];
     };
 
-<<<<<<< HEAD
-    devShellHook = ''
-      export HERMES_PYTHON=${hermesVenv}/bin/python3
-    '';
-
-    devDeps = runtimeDeps ++ [ (mkHermesVenv (extraDependencyGroups ++ [ "dev" ])) ];
-  };
-
-=======
->>>>>>> v2026.7.20
   meta = with lib; {
     description = "AI agent with advanced tool-calling capabilities";
     homepage = "https://github.com/NousResearch/hermes-agent";

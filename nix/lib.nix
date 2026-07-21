@@ -1,10 +1,6 @@
 # nix/lib.nix — Shared helpers for nix stuff
 #
 # All npm packages in this repo are workspace members sharing a single
-<<<<<<< HEAD
-# root package-lock.json.  mkNpmPassthru provides the shared src, npmDeps,
-# npmRoot, and npmConfigHook so individual .nix files don't duplicate them.
-=======
 # root package-lock.json.  mkNpmPassthru provides the shared npmDeps,
 # npmRoot, and npmConfigHook so individual .nix files don't duplicate them.
 #
@@ -14,7 +10,6 @@
 # filtered src that only includes files it actually needs, while keeping
 # the repo-root directory layout intact for buildNpmPackage /
 # npmConfigHook workspace resolution.
->>>>>>> v2026.7.20
 #
 # mkNpmPassthru returns packageJsonPath (e.g. "ui-tui/package.json")
 # instead of a per-package devShellHook.  The root devshell hook
@@ -30,8 +25,6 @@
 let
   repoRoot = ./..;
 
-<<<<<<< HEAD
-=======
   # ── npm workspace discovery ────────────────────────────────────────
   # Single source of truth: the `workspaces` field of the root
   # package.json.  Everything below (workspace package.json discovery,
@@ -172,7 +165,6 @@ let
     fileset = npmWorkspaceFiles;
   };
 
->>>>>>> v2026.7.20
   # npm dependencies for the workspace, shared by all members. importNpmLock
   # resolves each package from the lockfile's own `integrity` hashes, so the
   # lockfile is the single source of truth — no separate dependency hash to
@@ -225,15 +217,12 @@ in
   #   npmConfigHook              — importNpmLock's offline `npm install` hook
   #   passthru.packageJsonPath   — relative path to this workspace's package.json
   #   nodejs                     — fixed nodejs version for all packages we use in the repo
-<<<<<<< HEAD
-=======
   #
   # `dirs` is the single source of truth for what the package contains:
   # its first entry is the package's own folder (→ packageJsonPath), and
   # all entries scope the filtered src.  Packages that import source from
   # another workspace member (file: deps) must list that member's dir too,
   # e.g. apps/desktop depends on apps/shared.
->>>>>>> v2026.7.20
   #
   # Usage:
   #   npm = hermesNpmLib.mkNpmPassthru { dirs = [ "ui-tui" ]; };
@@ -255,12 +244,8 @@ in
       # so npmConfigHook finds the lockfile there.
     in
     {
-<<<<<<< HEAD
-      inherit src npmDeps nodejs;
-=======
       inherit nodejs npmDeps;
       src = mkNpmSrc dirs;
->>>>>>> v2026.7.20
       # importNpmLock's hook installs the rewritten lockfile (every `resolved`
       # rewritten to a /nix/store file: path) into the unpacked workspace and
       # runs `npm install` offline, so every workspace member's dependencies
@@ -270,27 +255,6 @@ in
 
       ELECTRON_SKIP_BINARY_DOWNLOAD = 1;
 
-<<<<<<< HEAD
-      nativeBuildInputs = [
-        (pkgs.writeShellScriptBin "update_${attr}_lockfile" ''
-          set -euox pipefail
-
-          REPO_ROOT=$(git rev-parse --show-toplevel)
-
-          # All workspace packages share the root lockfile.
-          cd "$REPO_ROOT"
-          rm -rf node_modules/
-          ${pkgs.lib.getExe' nodejs "npm"} cache clean --force
-          CI=true ${pkgs.lib.getExe' nodejs "npm"} install --workspaces
-          ${pkgs.lib.getExe npm-lockfile-fix} ./package-lock.json
-
-          nix build .#${attr}
-          echo "Lockfile updated and build verified for .#${attr}"
-        '')
-      ];
-
-=======
->>>>>>> v2026.7.20
       passthru = {
         packageJsonPath = "${folder}/package.json";
       };
