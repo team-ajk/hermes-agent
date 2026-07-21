@@ -5281,14 +5281,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             _text: str = final_response,
                         ) -> None:
                             try:
-                                from tools.tts_tool import check_tts_requirements, text_to_speech_tool
+                                import tools.tts_tool as _tts_mod
                                 import base64 as _b64
                                 import json as _json
                                 import os as _os
-                                if not check_tts_requirements():
+                                if not _tts_mod.check_tts_requirements():
                                     return
                                 _tts_result = await asyncio.get_running_loop().run_in_executor(
-                                    None, text_to_speech_tool, _text
+                                    None, _tts_mod.text_to_speech_tool, _text
                                 )
                                 _tts_data = _json.loads(_tts_result) if isinstance(_tts_result, str) else {}
                                 _tts_path = _tts_data.get("file_path")

@@ -4231,16 +4231,29 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # office docs, ...). Previously these were silently dropped,
                 # so document-oriented MCP tools appeared to return metadata
                 # only (enterprise customer report, 2026-07).
-                resource_text = _render_mcp_resource_block(block, server_name)
                 r = getattr(block, "resource", None)
                 if r is not None:
-                    resources.append({
-                        "uri": getattr(r, "uri", None),
-                        "mimeType": getattr(r, "mimeType", None),
-                        "text": getattr(r, "text", None),
-                        "blob": getattr(r, "blob", None),
-                        "_meta": getattr(r, "meta", None),
-                    })
+                    # EmbeddedResource: surface structured metadata under
+                    # result["resources"] for plugins; text content (if any)
+                    # goes into result; blob content does not (it's binary).
+                    entry: dict = {}
+                    if getattr(r, "uri", None) is not None:
+                        entry["uri"] = str(r.uri)
+                    if getattr(r, "mimeType", None) is not None:
+                        entry["mimeType"] = r.mimeType
+                    if getattr(r, "text", None) is not None:
+                        entry["text"] = r.text
+                    if getattr(r, "blob", None) is not None:
+                        entry["blob"] = r.blob
+                    if getattr(r, "meta", None) is not None:
+                        entry["_meta"] = r.meta
+                    resources.append(entry)
+                    # Text resources contribute to model-facing result;
+                    # blob resources are binary and do not.
+                    if getattr(r, "text", None):
+                        parts.append(r.text)
+                    continue
+                resource_text = _render_mcp_resource_block(block, server_name)
                 if resource_text:
                     parts.append(resource_text)
                     continue
@@ -4267,12 +4280,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # is the primary payload; structuredContent supplements it.
             structured = getattr(result, "structuredContent", None)
             if structured is not None:
-                if text_result:
-                    return json.dumps({
-                        "result": text_result,
-                        "structuredContent": structured,
-                    }, ensure_ascii=False)
-                return json.dumps({"result": structured}, ensure_ascii=False)
+                resp: dict = {"result": text_result, "structuredContent": structured}
+                if resources:
+                    resp["resources"] = resources
+                return json.dumps(resp, ensure_ascii=False)
             if resources:
                 return json.dumps({"result": text_result, "resources": resources}, ensure_ascii=False)
             return json.dumps({"result": text_result}, ensure_ascii=False)
