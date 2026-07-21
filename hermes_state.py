@@ -6085,7 +6085,7 @@ class SessionDB:
         session = self.get_session(session_id)
         if not session:
             return None
-        messages = self.get_messages(session_id, include_inactive=include_inactive)
+        messages = self.get_messages(session_id)
         return {**session, "messages": messages}
 
     def export_session_lineage(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -6120,7 +6120,7 @@ class SessionDB:
         results = []
         for session in sessions:
             messages = self.get_messages(
-                session["id"], include_inactive=include_inactive
+                session["id"]
             )
             results.append({**session, "messages": messages})
         return results
